@@ -2,8 +2,8 @@
 eleventyNavigation:
   key: Rows
   order: 4
-Update: 2018-12-12
-Version: VisiData 1.5.1
+Update: 2023-10-12
+Version: VisiData 3.0
 ---
 
 
@@ -29,7 +29,7 @@ An example usage follows.
 
 ## How to filter rows
 
-1. Press `s` or `t` on the rows to filter.
+1. Press `s` or `t` on the rows to be filtered.
 
 2. Press
 
@@ -109,14 +109,22 @@ Command(s)         Operation
 3. Move the cursor to the desired location.
 3. Press `p`/`Shift+P` to paste those rows after/before current row.
 
+###### Note
+
+ VisiData has a universal paste mechanism: it creates new rows on the target sheet and then fills them with values from the copied rows from the previous sheet.
+
+ This value-filling happens positionally, so if columns are missing or in a different order, the values will be in different columns,
+
 ---
 
 ## How to sort rows
 
 Command(s)         Operation
 -----------------  -------------
- `[`  `]`          sorts ascending/descending by **current** column
-`g[` `g]`          sorts ascending/descending by **all key** columns
+ `[`  `]`          sorts ascending/descending by **current** column; replace any existing sort criteria
+`g[` `g]`          sorts ascending/descending by **all key** columns; replace any existing sort criteria
+`z[` `z]`          sorts ascending/descending by **current** column; add to existing sort criteria
+`gz[` `gz]`        sorts ascending/descending by **all key** column; add to existing sort criteria
 
 ###### How to sort a numerical column from highest number to lowest:
 
@@ -132,6 +140,11 @@ Command(s)         Operation
 
 1. Press `!` on those columns to designate them as key columns.
 2. Press `g[` or `g]` to sort.
+
+**or**
+
+1. Sort the first column with `[` or `]`.
+2. Sort the next column with `z[` or `z]` to add sorting to the existing criteria.
 
 ###### How to increase row height
 

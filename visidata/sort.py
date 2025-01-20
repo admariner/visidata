@@ -1,9 +1,6 @@
 from copy import copy
 from visidata import vd, asyncthread, Progress, Sheet, options, UNLOADED
 
-Sheet.init('_ordering', list, copy=True)  # (col:Column, reverse:bool)
-
-
 @Sheet.api
 def orderBy(sheet, *cols, reverse=False):
     'Add *cols* to internal ordering and re-sort the rows accordingly.  Pass *reverse* as True to order these *cols* descending.  Pass empty *cols* (or cols[0] of None) to clear internal ordering.'
@@ -38,19 +35,26 @@ class Reversor:
         return other.obj < self.obj
 
 
-@Sheet.api
-def sortkey(self, r, prog=None):
+
+@Sheet.cached_property
+def ordering(sheet) -> 'list[tuple[Column, bool]]':
     ret = []
-    for col, reverse in self._ordering:
+    for col, reverse in sheet._ordering:
         if isinstance(col, str):
-            col = self.column(col)
+            col = sheet.column(col)
+        ret.append((col, reverse))
+    return ret
+
+
+@Sheet.api
+def sortkey(sheet, r, ordering:'list[tuple[Column, bool]]'=[]):
+    ret = []
+    for col, reverse in (ordering or sheet.ordering):
         val = col.getTypedValue(r)
         ret.append(Reversor(val) if reverse else val)
 
-    if prog:
-        prog.addProgress(1)
-
     return ret
+
 
 @Sheet.api
 @asyncthread
@@ -60,8 +64,14 @@ def sort(self):
         return
     try:
         with Progress(gerund='sorting', total=self.nRows) as prog:
+            # replace ambiguous colname strings with unambiguous Column objects  #2494
+            self._ordering = self.ordering
+            def _sortkey(r):
+                prog.addProgress(1)
+                return self.sortkey(r, ordering=self._ordering)
+
             # must not reassign self.rows: use .sort() instead of sorted()
-            self.rows.sort(key=lambda r,self=self,prog=prog: self.sortkey(r, prog=prog))
+            self.rows.sort(key=_sortkey)
     except TypeError as e:
         vd.warning('sort incomplete due to TypeError; change column type')
         vd.exceptionCaught(e, status=False)
@@ -78,3 +88,12 @@ Sheet.addCommand('z[', 'sort-asc-add', 'orderBy(cursorCol)', 'sort ascending by 
 Sheet.addCommand('z]', 'sort-desc-add', 'orderBy(cursorCol, reverse=True)', 'sort descending by current column; add to existing sort criteria')
 Sheet.addCommand('gz[', 'sort-keys-asc-add', 'orderBy(*keyCols)', 'sort ascending by all key columns; add to existing sort criteria')
 Sheet.addCommand('gz]', 'sort-keys-desc-add', 'orderBy(*keyCols, reverse=True)', 'sort descending by all key columns; add to existing sort criteria')
+
+vd.addMenuItems('''
+    Column > Sort by > current column only > ascending > sort-asc
+    Column > Sort by > current column only > descending > sort-desc
+    Column > Sort by > current column also > ascending > sort-asc-add
+    Column > Sort by > current column also > descending > sort-desc-add
+    Column > Sort by > key columns > ascending > sort-keys-asc
+    Column > Sort by > key columns > descending > sort-keys-desc
+''')

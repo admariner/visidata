@@ -7,10 +7,11 @@ import re
 import time
 import json
 
-from visidata import options, anytype, stacktrace, vd
+from visidata import options, anytype, stacktrace, vd, drawcache
 from visidata import asyncthread, dispwidth, clipstr, iterchars
 from visidata import wrapply, TypedWrapper, TypedExceptionWrapper
-from visidata import Extensible, AttrDict, undoAttrFunc
+from visidata import Extensible, AttrDict, undoAttrFunc, ExplodingMock, MissingAttrFormatter
+from visidata import getitem, setitem, getitemdef, getitemdeep, setitemdeep, getattrdeep, setattrdeep, iterchunks
 
 class InProgress(Exception):
     @property
@@ -20,30 +21,15 @@ class InProgress(Exception):
 INPROGRESS = TypedExceptionWrapper(None, exception=InProgress())  # sentinel
 
 vd.option('col_cache_size', 0, 'max number of cache entries in each cached column')
-vd.option('clean_names', False, 'clean column/sheet names to be valid Python identifiers', replay=True)
-
-__all__ = [
-    'clean_to_id',
-    'Column',
-    'setitem',
-    'getattrdeep',
-    'setattrdeep',
-    'getitemdef',
-    'ColumnAttr', 'AttrColumn',
-    'ColumnItem', 'ItemColumn',
-    'SettableColumn',
-    'SubColumnFunc',
-    'SubColumnItem',
-    'SubColumnAttr',
-    'ColumnExpr', 'ExprColumn',
-    'DisplayWrapper',
-]
+vd.option('disp_formatter', 'generic', 'formatter to create the text in each cell (also used by text savers)', replay=True)
+vd.option('disp_displayer', 'generic', 'displayer to render the text in each cell', replay=False)
 
 
 class DisplayWrapper:
-    def __init__(self, value=None, *, display=None, note=None, notecolor=None, error=None):
+    def __init__(self, value=None, *, typedval=None, text='', note=None, notecolor=None, error=None):
         self.value = value      # actual value (any type)
-        self.display = display  # displayed string
+        self.typedval = typedval  # consistently typed value (or None)
+        self.text = text  # displayed string
         self.note = note        # single unicode character displayed in cell far right
         self.notecolor = notecolor  # configurable color name (like 'color_warning')
         self.error = error      # list of strings for stacktrace
@@ -53,11 +39,6 @@ class DisplayWrapper:
 
     def __eq__(self, other):
         return self.value == other
-
-
-def clean_to_id(s):  # [Nas Banov] https://stackoverflow.com/a/3305731
-    return re.sub(r'\W|^(?=\d)', '_', str(s)).strip('_')
-
 
 def _default_colnames():
     'A B C .. Z AA AB .. ZZ AAA .. to infinity'
@@ -88,14 +69,14 @@ class Column(Extensible):
         - *kwargs*: other attributes to be set on this column.
     '''
     def __init__(self, name=None, *, type=anytype, cache=False, **kwargs):
-        self.sheet = None     # owning Sheet, set in .recalc() via Sheet.addColumn
+        self.sheet = ExplodingMock('use addColumn() on all columns')  # owning Sheet, set in .recalc() via Sheet.addColumn
         if name is None:
             name = next(default_colnames)
         self.name = str(name) # display visible name
         self.fmtstr = ''      # by default, use str()
         self._type = type     # anytype/str/int/float/date/func
         self.getter = lambda col, row: row
-        self.setter = lambda col, row, value: vd.fail(col.name+' column cannot be changed')
+        self.setter = None
         self._width = None    # == 0 if hidden, None if auto-compute next time
         self.hoffset = 0      # starting horizontal (char) offset of displayed column value
         self.voffset = 0      # starting vertical (line) offset of displayed column value
@@ -103,6 +84,9 @@ class Column(Extensible):
         self.keycol = 0       # keycol index (or 0 if not key column)
         self.expr = None      # Column-type-dependent parameter
         self.formatter = ''
+        self.displayer = ''
+        self.defer = False
+        self.disp_expert = 0    # auto-hide if options.disp_expert less than col.disp_expert
 
         self.setCache(cache)
         for k, v in kwargs.items():
@@ -117,13 +101,17 @@ class Column(Extensible):
             ret._cachedValues = collections.OrderedDict()  # an unrelated cache for copied columns
         return ret
 
+    def __str__(self):
+        return f'{type(self).__name__}:{self.name}'
+
+    def __repr__(self):
+        return f'<{type(self).__name__}: {self.name}>'
+
     def __deepcopy__(self, memo):
         return self.__copy__()  # no separate deepcopy
 
     def __getstate__(self):
-        d = {k:getattr(self, k) for k in 'name width height expr keycol formatter fmtstr voffset hoffset aggstr'.split() if hasattr(self, k)}
-        d['type'] = self.type.__name__
-        return d
+        return {k:getattr(self, k) for k in 'name typestr width height expr keycol formatter displayer fmtstr voffset hoffset aggstr'.split() if hasattr(self, k)}
 
     def __setstate__(self, d):
         for attr, v in d.items():
@@ -144,6 +132,9 @@ class Column(Extensible):
 
     @name.setter
     def name(self, name):
+        self.setName(name)
+
+    def setName(self, name):
         if name is None:
             name = ''
         if isinstance(name, str):
@@ -194,6 +185,20 @@ class Column(Extensible):
             self._width = w
 
     @property
+    def formatted_help(self):
+        return MissingAttrFormatter().format(self.help, sheet=self.sheet, col=self, vd=vd)
+
+    @property
+    def help_formatters(self):
+        formatters = [k[10:] for k in dir(self) if k.startswith('formatter_')]
+        return ' '.join(formatters)
+
+    @property
+    def help_displayers(self):
+        displayers = [k[10:] for k in dir(self) if k.startswith('displayer_')]
+        return ' '.join(displayers)
+
+    @property
     def _formatdict(col):
         if '=' in col.fmtstr:
             return dict(val.split('=', maxsplit=1) for val in col.fmtstr.split())
@@ -210,9 +215,9 @@ class Column(Extensible):
 
     def _format_len(self, typedval, **kwargs):
         if isinstance(typedval, dict):
-            return f'{len(typedval)}'
+            return f'{{{len(typedval)}}}'
         elif isinstance(typedval, (list, tuple)):
-            return f'[len(typedval)]'
+            return f'[{len(typedval)}]'
 
         return self.formatValue(typedval, **kwargs)
 
@@ -228,6 +233,7 @@ class Column(Extensible):
     def formatter_python(self, fmtstr):
         return lambda v,*args,**kwargs: str(v)
 
+    @drawcache
     def make_formatter(self):
         'Return function for format(v) from the current formatter and fmtstr'
         _formatMaker = getattr(self, 'formatter_'+(self.formatter or self.sheet.options.disp_formatter))
@@ -249,7 +255,34 @@ class Column(Extensible):
         if isinstance(typedval, bytes):
             typedval = typedval.decode(options.encoding, options.encoding_errors)
 
-        return vd.getType(self.type).formatter(self.fmtstr, typedval)
+        gt = vd.getType(self._type)
+        return gt.formatter(self._fmtstr or gt.fmtstr, typedval)
+
+    def displayer_generic(self, dw:DisplayWrapper, width=None):
+        '''Fit *dw.text* into *width* charcells.
+           Generate list of (attr:str, text:str) suitable for clipdraw_chunks.
+
+           The 'generic' displayer does not do any formatting.
+        '''
+        if width is not None and width > 1 and vd.isNumeric(self):
+            yield ('', dw.text.rjust(width-2))
+        else:
+            yield ('', dw.text)
+
+    def displayer_full(self, dw:DisplayWrapper, width=None):
+        '''Fit *dw.text* into *width* charcells.
+           Generate list of (attr:str, text:str) suitable for clipdraw_chunks.
+
+           The 'full' displayer allows formatting like [:color].
+        '''
+        if width is not None and width > 1 and vd.isNumeric(self):
+            yield from iterchunks(dw.text.rjust(width-2))
+        else:
+            yield from iterchunks(dw.text)
+
+    def display(self, *args, **kwargs):
+        f = getattr(self, 'displayer_'+(self.displayer or self.sheet.options.disp_displayer), self.displayer_generic)
+        return f(*args, **kwargs)
 
     def hide(self, hide=True):
         if hide:
@@ -283,7 +316,7 @@ class Column(Extensible):
 
     @asyncthread
     def _calcIntoCacheAsync(self, row):
-        # causes isues when moved into _calcIntoCache gen case
+        # causes issues when moved into _calcIntoCache gen case
         self._cachedValues[self.sheet.rowid(row)] = INPROGRESS
         self._calcIntoCache(row)
 
@@ -296,7 +329,7 @@ class Column(Extensible):
     def getValue(self, row):
         'Return value for *row* in this column, calculating if not cached.'
 
-        if self.sheet.defer:
+        if self.defer:
             try:
                 row, rowmods = self.sheet._deferredMods[self.sheet.rowid(row)]
                 return rowmods[self]
@@ -334,34 +367,34 @@ class Column(Extensible):
                 else:
                     dispval = options.disp_error_val
                 return DisplayWrapper(cellval.val, error=exc.stacktrace,
-                                        display=dispval,
-                                        note=options.note_getter_exc,
+                                        text=dispval,
+                                        note=f'[:onclick error-cell]{options.disp_note_getexc}[:]',
                                         notecolor='color_error')
             elif typedval.val is None:  # early out for strict None
-                return DisplayWrapper(None, display='',  # force empty display for None
+                return DisplayWrapper(None, text='',  # force empty display for None
                                             note=options.disp_note_none,
                                             notecolor='color_note_type')
             elif isinstance(typedval, TypedExceptionWrapper):  # calc succeeded, type failed
-                return DisplayWrapper(typedval.val, display=str(cellval),
+                return DisplayWrapper(typedval.val, text=str(cellval),
                                             error=typedval.stacktrace,
-                                            note=options.note_type_exc,
+                                            note=f'[:onclick error-cell]{options.disp_note_typeexc}[:]',
                                             notecolor='color_warning')
             else:
-                return DisplayWrapper(typedval.val, display=str(typedval.val),
-                                            error='unknown',
-                                            note=options.note_type_exc,
+                return DisplayWrapper(typedval.val, text=str(typedval.val),
+                                            error=['unknown'],
+                                            note=f'[:onclick error-cell]{options.disp_note_typeexc}[:]',
                                             notecolor='color_warning')
-
         elif isinstance(typedval, threading.Thread):
             return DisplayWrapper(None,
-                                display=options.disp_pending,
-                                note=options.note_pending,
+                                text=options.disp_pending,
+                                note=options.disp_note_pending,
                                 notecolor='color_note_pending')
 
         dw = DisplayWrapper(cellval)
+        dw.typedval = typedval
 
         try:
-            dw.display = self.format(typedval, width=(self.width or 0)*2) or ''
+            dw.text = self.format(typedval, width=(self.width or 0)*2) or ''
 
             # annotate cells with raw value type in anytype columns, except for strings
             if self.type is anytype and type(cellval) is not str:
@@ -374,51 +407,50 @@ class Column(Extensible):
             e.stacktrace = stacktrace()
             dw.error = e.stacktrace
             try:
-                dw.display = str(cellval)
+                dw.text = str(cellval)
             except Exception as e:
-                dw.display = str(e)
-            dw.note = options.note_format_exc
+                dw.text = str(e)
+            dw.note = options.disp_note_fmtexc
             dw.notecolor = 'color_warning'
 
+#        dw.display = self.display(dw)   # set during draw() once colwidth is known
         return dw
 
     def getDisplayValue(self, row):
         'Return string displayed in this column for given *row*.'
-        return self.getCell(row).display
+        return self.getCell(row).text
 
     def putValue(self, row, val):
-        'Change value for *row* in this column to *val* immediately.  Does not check the type.  Overrideable; by default calls ``.setter(row, val)``.'
-        return self.setter(self, row, val)
+        'Change value for *row* in this column to *val* immediately.  Does not check the type.  Overridable; by default calls ``.setter(row, val)``.'
+        if self.setter:
+            return self.setter(self, row, val)
 
-    def setValue(self, row, val):
-        'Change value for *row* in this column to *val*.  Call ``putValue`` immediately if parent ``sheet.defer`` is False, otherwise cache until later ``putChanges``.  Caller must add undo function.'
-        if self.sheet.defer:
+    def setValue(self, row, val, setModified=True):
+        'Change value for *row* in this column to *val*.  Call ``putValue`` immediately if not a deferred column (added to deferred parent at load-time); otherwise cache until later ``putChanges``.  Caller must add undo function.'
+        if self.defer:
             self.cellChanged(row, val)
         else:
             self.putValue(row, val)
-        self.sheet.setModified()
-
-    def setValueSafe(self, row, value):
-        'setValue and ignore exceptions.'
-        try:
-            return self.setValue(row, value)
-        except Exception as e:
-            vd.exceptionCaught(e)
+        if setModified:  #1800
+            self.sheet.setModified()
 
     @asyncthread
     def setValues(self, rows, *values):
         'Set values in this column for *rows* to *values*, recycling values as needed to fill *rows*.'
         vd.addUndoSetValues([self], rows)
+
         for r, v in zip(rows, itertools.cycle(values)):
-            self.setValueSafe(r, v)
+            vd.callNoExceptions(self.setValue, r, v)
+
         self.recalc()
         return vd.status('set %d cells to %d values' % (len(rows), len(values)))
 
+    @asyncthread
     def setValuesTyped(self, rows, *values):
         'Set values on this column for *rows* to *values*, coerced to column type, recycling values as needed to fill *rows*.  Abort on type exception.'
         vd.addUndoSetValues([self], rows)
         for r, v in zip(rows, itertools.cycle(self.type(val) for val in values)):
-            self.setValueSafe(r, v)
+            vd.callNoExceptions(self.setValue, r, v)
 
         self.recalc()
 
@@ -429,91 +461,46 @@ class Column(Extensible):
         w = 0
         nlen = dispwidth(self.name)
         if len(rows) > 0:
-            w = max(max(dispwidth(self.getDisplayValue(r), maxwidth=self.sheet.windowWidth) for r in rows), nlen)+2
-        return max(w, nlen)
+            w_max = 0
+            for r in rows:
+                row_w = dispwidth(self.getDisplayValue(r), maxwidth=self.sheet.windowWidth)
+                if w_max < row_w:
+                    w_max = row_w
+                if w_max >= self.sheet.windowWidth:
+                    break  #1747  early out to speed up wide columns
+            w = w_max
+        w = max(w, nlen)+2
+        w = min(w, self.sheet.windowWidth)
+        return w
 
 
-# ---- Column makers
 
-def setitem(r, i, v):  # function needed for use in lambda
-    r[i] = v
-    return True
+# ---- basic Columns
 
-
-def getattrdeep(obj, attr, *default, getter=getattr):
-    try:
-        'Return dotted attr (like "a.b.c") from obj, or default if any of the components are missing.'
-        if not isinstance(attr, str):
-            return getter(obj, attr, *default)
-
-        try:  # if attribute exists, return toplevel value, even if dotted
-            if attr in obj:
-                return getter(obj, attr)
-        except Exception as e:
-            pass
-
-        attrs = attr.split('.')
-        for a in attrs[:-1]:
-            obj = getter(obj, a)
-
-        return getter(obj, attrs[-1])
-    except Exception as e:
-        if not default: raise
-        return default[0]
-
-
-def setattrdeep(obj, attr, val, getter=getattr, setter=setattr):
-    'Set dotted attr (like "a.b.c") on obj to val.'
-    if not isinstance(attr, str):
-        return setter(obj, attr, val)
-
-    try:  # if attribute exists, overwrite toplevel value, even if dotted
-        getter(obj, attr)
-        return setter(obj, attr, val)
-    except Exception as e:
-        pass
-
-    attrs = attr.split('.')
-    for a in attrs[:-1]:
-        try:
-            obj = getter(obj, a)
-        except Exception as e:
-            obj = obj[a] = type(obj)()  # assume homogenous nesting
-
-    setter(obj, attrs[-1], val)
-
-
-def getitemdeep(obj, k, *default):
-    return getattrdeep(obj, k, *default, getter=getitem)
-
-def setitemdeep(obj, k, val):
-    return setattrdeep(obj, k, val, getter=getitemdef, setter=setitem)
-
-def AttrColumn(name='', attr=None, **kwargs):
+class AttrColumn(Column):
     'Column using getattr/setattr with *attr*.'
-    return Column(name,
-                  expr=attr if attr is not None else name,
-                  getter=lambda col,row: getattrdeep(row, col.expr),
-                  setter=lambda col,row,val: setattrdeep(row, col.expr, val),
-                  **kwargs)
+    def __init__(self, name=None, expr=None, **kwargs):
+        super().__init__(name,
+            expr=expr if expr is not None else name,
+            getter=lambda col,row: getattrdeep(row, col.expr, None),
+            **kwargs)
 
-def getitem(o, k, default=None):
-    return default if o is None else o[k]
+    def putValue(self, row, val):
+        super().putValue(row, val)
+        setattrdeep(row, self.expr, val)
 
-def getitemdef(o, k, default=None):
-    try:
-        return default if o is None else o[k]
-    except Exception:
-        return default
 
 class ItemColumn(Column):
-    'Column using getitem/setitem with *key*.'
+    'Column using getitem/setitem with *expr*.'
     def __init__(self, name=None, expr=None, **kwargs):
         super().__init__(name,
             expr=expr if expr is not None else name,
             getter=lambda col,row: getitemdeep(row, col.expr, None),
-            setter=lambda col,row,val: setitemdeep(row, col.expr, val),
             **kwargs)
+
+    def putValue(self, row, val):
+        super().putValue(row, val)
+        setitemdeep(row, self.expr, val)
 
 
 class SubColumnFunc(Column):
@@ -550,46 +537,9 @@ def SubColumnItem(idx, c, **kwargs):
         kwargs['name'] = c.name
     return SubColumnFunc(origcol=c, subfunc=getitemdef, expr=idx, **kwargs)
 
-class ExprColumn(Column):
-    'Column using *expr* to derive the value from each row.'
-    def __init__(self, name, expr=None, **kwargs):
-        super().__init__(name, **kwargs)
-        self.expr = expr or name
-        self.ncalcs = 0
-        self.totaltime = 0
-        self.maxtime = 0
-
-    def calcValue(self, row):
-        t0 = time.perf_counter()
-        r = self.sheet.evalExpr(self.compiledExpr, row, col=self)
-        t1 = time.perf_counter()
-        self.ncalcs += 1
-        self.maxtime = max(self.maxtime, t1-t0)
-        self.totaltime += (t1-t0)
-        return r
-
-    def putValue(self, row, val):
-        a = self.getDisplayValue(row)
-        b = self.format(self.type(val))
-        if a != b:
-            vd.warning('%s calced %s not %s' % (self.name, a, b))
-
-    @property
-    def expr(self):
-        return self._expr
-
-    @expr.setter
-    def expr(self, expr):
-        self.compiledExpr = compile(expr, '<expr>', 'eval') if expr else None
-        self._expr = expr
-
 
 class SettableColumn(Column):
     'Column using rowid to store and retrieve values internally.'
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._store = {}
-
     def putValue(self, row, value):
         self._store[self.sheet.rowid(row)] = value
 
@@ -597,7 +547,25 @@ class SettableColumn(Column):
         return self._store.get(self.sheet.rowid(row), None)
 
 
+SettableColumn.init('_store', dict, copy=True)
+
+
+vd.addGlobals(
+    INPROGRESS=INPROGRESS,
+    Column=Column,
+    setitem=setitem,
+    getattrdeep=getattrdeep,
+    setattrdeep=setattrdeep,
+    getitemdef=getitemdef,
+    AttrColumn=AttrColumn,
+    ItemColumn=ItemColumn,
+    SettableColumn=SettableColumn,
+    SubColumnFunc=SubColumnFunc,
+    SubColumnItem=SubColumnItem,
+    SubColumnAttr=SubColumnAttr,
+
 # synonyms
-ColumnItem = ItemColumn
-ColumnAttr = AttrColumn
-ColumnExpr = ExprColumn
+    ColumnItem=ItemColumn,
+    ColumnAttr=AttrColumn,
+    DisplayWrapper=DisplayWrapper
+)

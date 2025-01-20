@@ -3,11 +3,11 @@
 # as plugin: `from viewtsv import open_tsv` in .visidatarc
 # standalone: `viewtsv.py <tsv-files>'
 
-from visidata import Sheet, ColumnItem, asyncthread, options
+from visidata import VisiData, Sheet, ColumnItem, asyncthread, options
 
 @VisiData.api
 def open_tsv(vd, p):
-    return MinimalTsvSheet(p.name, source=p)
+    return MinimalTsvSheet(p.base_stem, source=p)
 
 
 class MinimalTsvSheet(Sheet):
@@ -37,5 +37,5 @@ class MinimalTsvSheet(Sheet):
 # a minimal main() for standalone apps
 if __name__ == '__main__':
     import sys
-    from visidata import run, Path
-    run(*(open_tsv(Path(fn)) for fn in sys.argv[1:]))
+    from visidata import run, Path, vd
+    run(*(vd.open_tsv(Path(fn)) for fn in sys.argv[1:]))

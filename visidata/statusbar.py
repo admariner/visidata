@@ -1,30 +1,80 @@
+'''
+Status messages get added with vd.{debug/aside/status/warning/fail/error}(), and cleared in mainloop
+'''
+
+import builtins
 import collections
 import curses
+import sys
 
-from visidata import vd, VisiData, BaseSheet, Sheet, ColumnItem, Column, RowColorizer, options, colors, wrmap, clipdraw, ExpectedException, update_attr, MissingAttrFormatter
+import visidata
+from visidata import vd, VisiData, BaseSheet, Sheet, ColumnItem, Column, RowColorizer, options, colors, wrmap, clipdraw, ExpectedException, update_attr, dispwidth, ColorAttr
 
 
-vd.option('disp_rstatus_fmt', ' {sheet.longname} {sheet.nRows:9d} {sheet.rowtype} {sheet.modifiedStatus} {sheet.options.disp_selected_note}{sheet.nSelectedRows}', 'right-side status format string')
-vd.option('disp_status_fmt', '{sheet.shortcut}› {sheet.name}| ', 'status line prefix')
-vd.option('disp_lstatus_max', 0, 'maximum length of left status line')
-vd.option('disp_status_sep', ' │ ', 'separator between statuses')
 
-vd.option('color_keystrokes', 'bold 233 black on 110 cyan', 'color of input keystrokes on status line')
-vd.option('color_status', 'bold black on 110 cyan', 'status line color')
-vd.option('color_error', 'red', 'error message color')
-vd.option('color_warning', 'yellow', 'warning message color')
-vd.option('color_top_status', 'underline', 'top window status bar color')
-vd.option('color_active_status', 'black on 110 cyan', ' active window status bar color')
-vd.option('color_inactive_status', '8 on black', 'inactive window status bar color')
+vd.option('disp_rstatus_fmt', '{sheet.threadStatus} {sheet.keystrokeStatus}   [:longname_status]{sheet.longname}[/]  {sheet.nRows:9d} {sheet.rowtype} {sheet.modifiedStatus}{sheet.selectedStatus}{vd.replayStatus}{vd.sidebarStatus}', 'right-side status format string')
+vd.option('disp_status_fmt', '{sheet.sheetlist}| ', 'left-side status format string')
+vd.theme_option('disp_lstatus_max', 0, 'maximum length of left status line')
+vd.theme_option('disp_status_sep', '│', 'separator between statuses')
+
+vd.theme_option('color_keystrokes', 'bold white on 237', 'color of input keystrokes')
+vd.theme_option('color_longname_guide', '237', 'color of command longnames')
+vd.theme_option('color_longname_status', 'white', 'color of command longnames')
+vd.theme_option('color_keys', 'bold reverse', 'color of keystrokes in help')
+vd.theme_option('color_status', 'bold on 238', 'status line color')
+vd.theme_option('color_error', '202 1', 'error message color')
+vd.theme_option('color_warning', '166 15', 'warning message color')
+vd.theme_option('color_top_status', 'underline', 'top window status bar color')
+vd.theme_option('color_active_status', 'black on 68 blue', ' active window status bar color')
+vd.theme_option('color_inactive_status', '8 on black', 'inactive window status bar color')
+vd.theme_option('color_highlight_status', 'black on green', 'color of highlighted elements in statusbar')
 
 BaseSheet.init('longname', lambda: '')
 
-vd.beforeExecHooks.append(lambda sheet, cmd, args, ks: setattr(sheet, 'longname', cmd.longname))
-
+def fitWithin(s, n=10):
+    if len(s) > n:
+        return s[:n//2-1] + '…' + s[-n//2+1:]
+    return s
 
 @BaseSheet.property
-def modifiedStatus(sheet):
-    return ' [M]' if sheet.hasBeenModified else ''
+def ancestors(sheet):
+    if isinstance(sheet.source, BaseSheet):
+        return sheet.source.ancestors + [sheet.source]
+    else:
+        return []
+
+@BaseSheet.property
+def sheetlist(sheet):
+    leafsheets = []
+    parents = set()
+
+    sheetstack = vd.sheetstack(sheet.pane)
+    sheets = [x for x in vd.allSheets if x in sheetstack]+ [x for x in sheetstack if x not in vd.allSheets]
+
+    sheetnames = []
+    for vs in sheets:
+        if isinstance(vs, BaseSheet):
+            shortcut = ' '
+            if vs.shortcut in '1 2 3 4 5 6 7 8 9 10'.split():
+                shortcut = vs.shortcut[-1] + '›'
+            if vs is vd.sheet:
+                sheetnames.append(f'[:menu_active]{shortcut}{vs.name}[:]')
+            else:
+                sheetnames.append(f'[:onclick jump-sheet-{vs.shortcut}]' + fitWithin(f'{shortcut}{vs.name}', 20) + '[:]')
+        else:
+            sheetnames.append(vs)
+
+    return ' | '.join(sheetnames)
+
+@BaseSheet.api
+def _updateStatusBeforeExec(sheet, cmd, args, ks):
+    sheet.longname = cmd.longname
+    if sheet._scr:
+        vd.drawRightStatus(sheet._scr, sheet)  #996 show longname during commands
+        sheet._scr.refresh()
+
+
+vd.beforeExecHooks.append(BaseSheet._updateStatusBeforeExec)
 
 
 @VisiData.lazy_property
@@ -37,6 +87,11 @@ def statusHistory(vd):
     return list()  # list of [priority, statusmsg, repeats] for all status messages ever
 
 @VisiData.api
+def getStatusSource(vd):
+    return None
+
+
+@VisiData.api
 def status(vd, *args, priority=0):
     'Display *args* on status until next action.'
     if not args:
@@ -45,17 +100,25 @@ def status(vd, *args, priority=0):
     k = (priority, tuple(map(str, args)))
     vd.statuses[k] = vd.statuses.get(k, 0) + 1
 
-    return vd.addToStatusHistory(*args, priority=priority)
+    source = vd.getStatusSource()
+
+    if not vd.cursesEnabled:
+        msg = '\r' + composeStatus(args)
+        if vd.options.debug:
+            msg += f' [{source}]'
+        builtins.print(msg, file=sys.stderr)
+
+    return vd.addToStatusHistory(*args, priority=priority, source=source)
 
 @VisiData.api
-def addToStatusHistory(vd, *args, priority=0):
+def addToStatusHistory(vd, *args, priority=0, source=None):
     if vd.statusHistory:
-        prevpri, prevargs, prevn = vd.statusHistory[-1]
+        prevpri, prevargs, _, _ = vd.statusHistory[-1]
         if prevpri == priority and prevargs == args:
             vd.statusHistory[-1][2] += 1
             return True
 
-    vd.statusHistory.append([priority, args, 1])
+    vd.statusHistory.append([priority, args, 1, source])
     return True
 
 @VisiData.api
@@ -76,6 +139,11 @@ def warning(vd, *args):
     vd.status(*args, priority=1)
 
 @VisiData.api
+def aside(vd, *args, priority=0):
+    'Add a message to statuses without showing the message proactively.'
+    return vd.addToStatusHistory(*args, priority=priority, source=vd.getStatusSource())
+
+@VisiData.api
 def debug(vd, *args, **kwargs):
     'Display *args* on status if options.debug is set.'
     if options.debug:
@@ -87,7 +155,7 @@ def middleTruncate(s, w):
     return s[:w] + options.disp_truncator + s[-w:]
 
 
-def composeStatus(msgparts, n):
+def composeStatus(msgparts, n=1):
     msg = '; '.join(wrmap(str, msgparts))
     if n > 1:
         msg = '[%sx] %s' % (n, msg)
@@ -97,13 +165,13 @@ def composeStatus(msgparts, n):
 @BaseSheet.api
 def leftStatus(sheet):
     'Return left side of status bar for this sheet. Overridable.'
-    return options.disp_status_fmt.format(sheet=sheet, vd=vd)
+    return sheet.formatString(sheet.options.disp_status_fmt)
 
 
 @VisiData.api
 def drawLeftStatus(vd, scr, vs):
     'Draw left side of status bar.'
-    cattr = colors.get_color('color_status')
+    cattr = colors.get_color('color_active_status')
     active = (vs is vd.activeSheet)
     if active:
         cattr = update_attr(cattr, colors.color_active_status, 1)
@@ -113,100 +181,79 @@ def drawLeftStatus(vd, scr, vs):
     if scr is vd.winTop:
         cattr = update_attr(cattr, colors.color_top_status, 1)
 
-    attr = cattr.attr
-    error_attr = update_attr(cattr, colors.color_error, 1).attr
-    warn_attr = update_attr(cattr, colors.color_warning, 2).attr
-    sep = options.disp_status_sep
-
     x = 0
     y = vs.windowHeight-1  # status for each window
-    try:
-        lstatus = vs.leftStatus()
-        maxwidth = options.disp_lstatus_max
-        if maxwidth > 0:
-            lstatus = middleTruncate(lstatus, maxwidth//2)
+    lstatus = vs.leftStatus()
+    maxwidth = options.disp_lstatus_max
+    if maxwidth > 0:
+        lstatus = middleTruncate(lstatus, maxwidth//2)
 
-        x = clipdraw(scr, y, 0, lstatus, attr, w=vs.windowWidth-1)
+    x = clipdraw(scr, y, 0, lstatus, cattr, w=vs.windowWidth-1)
 
-        vd.onMouse(scr, y, 0, 1, x,
-                        BUTTON1_PRESSED='sheets',
-                        BUTTON3_PRESSED='rename-sheet',
-                        BUTTON3_CLICKED='rename-sheet')
-    except Exception as e:
-        vd.exceptionCaught(e)
-
-    if not active:
-        return
-
-    one = False
-    for (pri, msgparts), n in sorted(vd.statuses.items(), key=lambda k: -k[0][0]):
-        try:
-            if x > vs.windowWidth:
-                break
-            if one:  # any messages already:
-                x += clipdraw(scr, y, x, sep, attr, w=vs.windowWidth-x)
-            one = True
-            msg = composeStatus(msgparts, n)
-
-            if pri == 3: msgattr = error_attr
-            elif pri == 2: msgattr = warn_attr
-            elif pri == 1: msgattr = warn_attr
-            else: msgattr = attr
-            x += clipdraw(scr, y, x, msg, msgattr, w=vs.windowWidth-x)
-        except Exception as e:
-            vd.exceptionCaught(e)
+    vd.onMouse(scr, 0, y, x, 1,
+                    BUTTON3_PRESSED='rename-sheet',
+                    BUTTON3_CLICKED='rename-sheet')
 
 
 @VisiData.api
 def rightStatus(vd, sheet):
-    'Return right side of status bar.  Overrideable.'
-    return MissingAttrFormatter().format(sheet.options.disp_rstatus_fmt, sheet=sheet, vd=vd)
+    'Return right side of status bar.  Overridable.'
+    return sheet.formatString(sheet.options.disp_rstatus_fmt)
 
+
+@BaseSheet.property
+def keystrokeStatus(vs):
+    if vs is vd.activeSheet:
+        return f'[:keystrokes]{vd.keystrokes}[/]'
+
+    return ''
+
+
+@BaseSheet.property
+def threadStatus(vs) -> str:
+    if vs.currentThreads:
+        ret = str(vd.checkMemoryUsage())
+        gerunds = [p.gerund for p in vs.progresses if p.gerund] or ['processing']
+        ret += f' [:working]{vs.progressPct} {gerunds[0]}…[/]'
+        return ret
+    return ''
+
+@BaseSheet.property
+def modifiedStatus(sheet):
+    ret = ' [M]' if sheet.hasBeenModified else ''
+    if not vd.couldOverwrite():
+        ret += ' [:highlight_status][RO][/] '
+    return ret
+
+
+@BaseSheet.property
+def selectedStatus(sheet):
+    return ''
+
+
+@Sheet.property
+def selectedStatus(sheet):
+    if sheet.nSelectedRows:
+        return f' [:selected_row][:onclick dup-selected]{sheet.options.disp_selected_note}{sheet.nSelectedRows}[/][/] '
 
 @VisiData.api
 def drawRightStatus(vd, scr, vs):
     'Draw right side of status bar.  Return length displayed.'
     rightx = vs.windowWidth
 
-    ret = 0
-    statcolors = [
-        (vd.rightStatus(vs), 'color_status'),
-    ]
-
-    active = vs is vd.activeSheet
-
-    if active:
-        statcolors.append((f'{vd.prettykeys(vd.keystrokes)} ' or '', 'color_keystrokes'))
-
-    if vs.currentThreads:
-        statcolors.insert(0, vd.checkMemoryUsage())
-        gerunds = [p.gerund for p in vs.progresses if p.gerund] or ['processing']
-        statcolors.insert(1, ('  %s %s…' % (vs.progressPct, gerunds[0]), 'color_working'))
-
-    if active and vd.currentReplay:
-        statcolors.insert(0, (vd.replayStatus, 'color_status_replay'))
-
-    for rstatcolor in statcolors:
-        if rstatcolor:
-            try:
-                rstatus, coloropt = rstatcolor
-                rstatus = ' '+rstatus
-                cattr = colors.get_color(coloropt)
-                if scr is vd.winTop:
-                    cattr = update_attr(cattr, colors.color_top_status, 0)
-                if active:
-                    cattr = update_attr(cattr, colors.color_active_status, 1)
-                else:
-                    cattr = update_attr(cattr, colors.color_inactive_status, 1)
-                statuslen = clipdraw(scr, vs.windowHeight-1, rightx, rstatus, cattr.attr, w=vs.windowWidth-1, rtl=True)
-                rightx -= statuslen
-                ret += statuslen
-            except Exception as e:
-                vd.exceptionCaught(e)
-
-    if scr:
-        curses.doupdate()
-    return ret
+    statuslen = 0
+    try:
+        cattr = ColorAttr()
+        if scr is vd.winTop:
+            cattr = update_attr(cattr, colors.color_top_status, 0)
+        cattr = update_attr(cattr, colors.color_active_status if vs is vd.activeSheet else colors.color_inactive_status, 0)
+        rstat = vd.rightStatus(vs)
+        x = max(2, rightx-dispwidth(rstat)-1)
+        statuslen = clipdraw(scr, vs.windowHeight-1, x, rstat, cattr, w=vs.windowWidth-1)
+    finally:
+        if scr:
+            curses.doupdate()
+    return statuslen
 
 
 class StatusSheet(Sheet):
@@ -216,7 +263,8 @@ class StatusSheet(Sheet):
         ColumnItem('priority', 0, type=int, width=0),
         ColumnItem('nrepeats', 2, type=int, width=0),
         ColumnItem('args', 1, width=0),
-        Column('message', getter=lambda col,row: composeStatus(row[1], row[2])),
+        Column('message', width=50, getter=lambda col,row: composeStatus(row[1], row[2])),
+        ColumnItem('source', 3, width=0),
     ]
     colorizers = [
         RowColorizer(1, 'color_error', lambda s,c,r,v: r and r[0] == 3),
@@ -233,3 +281,7 @@ def statusHistorySheet(vd):
 
 
 BaseSheet.addCommand('^P', 'open-statuses', 'vd.push(vd.statusHistorySheet)', 'open Status History')
+
+vd.addMenuItems('''
+    View > Statuses > open-statuses
+''')

@@ -5,14 +5,50 @@ import io
 import codecs
 import pathlib
 from urllib.parse import urlparse, urlunparse
-from functools import wraps
+from functools import wraps, lru_cache
 
-from visidata import *
+from visidata import vd
+from visidata import VisiData, Progress
 
-vd.option('encoding', 'utf-8', 'encoding passed to codecs.open', replay=True)
-vd.option('encoding_errors', 'surrogateescape', 'encoding_errors passed to codecs.open', replay=True)
+vd.help_encoding = '''Common Encodings:
 
-@functools.lru_cache()
+- `utf-8`: Unicode (ASCII compatible, most common)
+- `utf-8-sig`: Unicode as above, but saves/skips leading BOM
+- `ascii`: 7-bit ASCII
+- `latin1`: also known as `iso-8859-1`
+- `cp437`: original IBM PC character set
+- `shift_jis`: Japanese
+
+See [:onclick https://docs.python.org/3/library/codecs.html#standard-encodings]https://docs.python.org/3/library/codecs.html#standard-encodings[/]
+'''
+
+vd.help_encoding_errors = '''Encoding Error Handlers:
+
+- `strict`: raise error
+- `ignore`: discard
+- `replace`: replacement marker
+- `backslashreplace`: use "\\uxxxxxx"
+- `surrogateescape`: use surrogate characters
+
+See [:onclick https://docs.python.org/3/library/codecs.html#error-handlers]https://docs.python.org/3/library/codecs.html#error-handlers[/]
+'''
+
+vd.option('encoding', 'utf-8-sig', 'encoding passed to codecs.open when reading a file', replay=True, help=vd.help_encoding)
+vd.option('encoding_errors', 'surrogateescape', 'encoding_errors passed to codecs.open', replay=True, help=vd.help_encoding_errors)
+
+@VisiData.api
+def pkg_resources_files(vd, package):
+    '''
+    Returns a Traversable object (Path-like), based on the location of the package.
+    importlib.resources.files exists in Python >= 3.9; use importlib_resources for the rest.
+    '''
+    try:
+        from importlib.resources import files
+    except ImportError: #1968
+        from importlib_resources import files
+    return files(package)
+
+@lru_cache()
 def vstat(path, force=False):
     try:
         return os.stat(path)
@@ -22,7 +58,9 @@ def vstat(path, force=False):
 def filesize(path):
     if hasattr(path, 'filesize') and path.filesize is not None:
         return path.filesize
-    if path.has_fp() or path.is_url():
+    if hasattr(path, 'is_url') and path.is_url():
+        return 0
+    if hasattr(path, 'has_fp') and path.has_fp():
         return 0
     st = path.stat() # vstat(path)
     return st and st.st_size
@@ -38,8 +76,8 @@ class BytesIOWrapper(io.BufferedReader):
 
     def __init__(self, text_io_buffer, encoding=None, errors=None, **kwargs):
         super(BytesIOWrapper, self).__init__(text_io_buffer, **kwargs)
-        self.encoding = encoding or text_io_buffer.encoding or options.encoding
-        self.errors = errors or text_io_buffer.errors or options.encoding_errors
+        self.encoding = encoding or text_io_buffer.encoding or vd.options.encoding
+        self.errors = errors or text_io_buffer.errors or vd.options.encoding_errors
 
     def _encoding_call(self, method_name, *args, **kwargs):
         raw_method = getattr(self.raw, method_name)
@@ -73,12 +111,11 @@ class FileProgress:
 
         # track Progress on original fp
         self.fp_orig_read = self.fp.read
+        self.fp_orig_readline = self.fp.readline
         self.fp_orig_close = self.fp.close
-        # These two lines result in bug #1159, a corrupted save of corruption formats
-        # for now we are reverting by commenting out, and opened #1175 to investigate
-        # Progress bars for compression formats might not work in the meanwhile
-        #self.fp.read = self.read
-        #self.fp.close = self.close
+
+        self.fp.read = self.read
+        self.fp.close = self.close
 
         if self.prog:
             self.prog.__enter__()
@@ -94,6 +131,12 @@ class FileProgress:
         if self.prog:
             if r:
                 self.prog.addProgress(len(r))
+        return r
+
+    def readline(self, size=-1):
+        r = self.fp_orig_readline(size)
+        if self.prog:
+            self.prog.addProgress(len(r))
         return r
 
     def __getattr__(self, k):
@@ -131,9 +174,10 @@ class Path(os.PathLike):
         self.filesize = filesize
         self.rfile = None
 
-    @functools.lru_cache()
-    def stat(self, force=False):
-        return self._path.stat()
+    @property
+    def name(self):
+        'Filename without any extensions.  Not the same as pathlib.Path.'
+        return self.base_stem
 
     @property
     def given(self):
@@ -149,16 +193,18 @@ class Path(os.PathLike):
             self._path = pathlib.Path(given)
 
         self.ext = self.suffix[1:]
-        if self.suffixes:  #1450  don't make this a oneliner; [:-0] doesn't work
-            self.name = self._path.name[:-sum(map(len, self.suffixes))]
+        if self.suffix:  #1450  don't make this a oneliner; [:-0] doesn't work
+            self.base_stem = self._path.name[:-len(self.suffix)]
+        elif self._given == '.':  #1768
+            self.base_stem = self._path.absolute().name
         else:
-            self.name = self._path.name
+            self.base_stem = self._path.name
 
         # check if file is compressed
         if self.suffix in ['.gz', '.bz2', '.xz', '.lzma', '.zst']:
             self.compression = self.ext
             uncompressedpath = Path(self.given[:-len(self.suffix)])  # strip suffix
-            self.name = uncompressedpath.name
+            self.base_stem = uncompressedpath.base_stem
             self.ext = uncompressedpath.ext
         else:
             self.compression = None
@@ -179,7 +225,7 @@ class Path(os.PathLike):
         return self._path.__fspath__()
 
     def __lt__(self, a):
-        if isinstance(a, visidata.Path):
+        if isinstance(a, Path):
             return self._path.__lt__(a._path)
         return self._path.__lt__(a)
 
@@ -190,24 +236,50 @@ class Path(os.PathLike):
         'Return True if this is a virtual Path to an already open file.'
         return bool(self.fp or self.fptext)
 
+    def open(self, mode='rt', encoding=None, encoding_errors=None, newline=None):
+        if 'b' in mode:
+            return self.open_bytes(mode)
+
+        return self.open_text(mode=mode, encoding=encoding, encoding_errors=encoding_errors, newline=newline)
+
+    def open_bytes(self, mode='rb'):
+        'Open the file pointed by this path and return a file object in binary mode.'
+        if self.rfile:
+            raise ValueError('a RepeatFile holds text and cannot be reopened in binary mode')
+
+        if 'b' not in mode:
+            mode += 'b'
+
+        if self.given == '-':
+            if 'r' in mode:
+                return os.fdopen(vd._stdin.fileno(), 'rb')
+            elif 'w' in mode or 'a' in mode:
+                # convert 'a' to 'w' for stdout: https://bugs.python.org/issue27805
+                return os.dup(vd._stdout.fileno())
+            else:
+                vd.error('invalid mode "%s" for Path.open()' % mode)
+                return sys.stderr
+
+        return self._open(mode=mode)
+
     def open_text(self, mode='rt', encoding=None, encoding_errors=None, newline=None):
         'Open path in text mode, using options.encoding and options.encoding_errors.  Return open file-pointer or file-pointer-like.'
         # rfile makes a single-access fp reusable
 
-        if self.rfile:
-            return self.rfile
+        if 't' not in mode:
+            mode += 't'
 
-        if self.fp:
+        if self.rfile:
+            return self.rfile.reopen()
+
+        if self.fp and not self.fptext:
             self.fptext = codecs.iterdecode(self.fp,
-                                            encoding=encoding or options.encoding,
-                                            errors=encoding_errors or options.encoding_errors)
+                                            encoding=encoding or vd.options.encoding,
+                                            errors=encoding_errors or vd.options.encoding_errors)
 
         if self.fptext:
             self.rfile = RepeatFile(self.fptext)
             return self.rfile
-
-        if 't' not in mode:
-            mode += 't'
 
         if self.given == '-':
             if 'r' in mode:
@@ -216,28 +288,30 @@ class Path(os.PathLike):
                 # convert 'a' to 'w' for stdout: https://bugs.python.org/issue27805
                 return open(os.dup(vd._stdout.fileno()), 'wt')
             else:
-                vd.error('invalid mode "%s" for Path.open_text()' % mode)
+                vd.error('invalid mode "%s" for Path.open()' % mode)
                 return sys.stderr
 
-        return self.open(mode=mode, encoding=encoding or vd.options.encoding, errors=vd.options.encoding_errors, newline=newline)
+        return self._open(mode=mode, encoding=encoding or vd.options.encoding, errors=vd.options.encoding_errors, newline=newline)
 
     @wraps(pathlib.Path.read_text)
     def read_text(self, *args, **kwargs):
         'Open the file in text mode and return its entire decoded contents.'
         if 'encoding' not in kwargs:
-            kwargs['encoding'] = options.encoding
+            kwargs['encoding'] = vd.options.encoding
         if 'errors' not in kwargs:
-            kwargs['errors'] = kwargs.get('encoding_errors', options.encoding_errors)
+            kwargs['errors'] = kwargs.get('encoding_errors', vd.options.encoding_errors)
 
         if self.lines:
             return RepeatFile(self.lines).read()
         elif self.fp:
             return self.fp.read()
+        elif self.fptext:
+            return self.fptext.read()
         else:
             return self._path.read_text(*args, **kwargs)
 
     @wraps(pathlib.Path.open)
-    def open(self, *args, **kwargs):
+    def _open(self, *args, **kwargs):
         if self.fp:
             return FileProgress(self, fp=self.fp, **kwargs)
 
@@ -245,39 +319,49 @@ class Path(os.PathLike):
             return FileProgress(self, fp=BytesIOWrapper(self.fptext), **kwargs)
 
         path = self
-        binmode = 'wb' if 'w' in kwargs.get('mode', '') else 'rb'
+
         if self.compression == 'gz':
             import gzip
-            return gzip.open(FileProgress(path, fp=open(path, mode=binmode), **kwargs), *args, **kwargs)
+            zopen = gzip.open
         elif self.compression == 'bz2':
             import bz2
-            return bz2.open(FileProgress(path, fp=open(path, mode=binmode), **kwargs), *args, **kwargs)
+            zopen = bz2.open
         elif self.compression in ['xz', 'lzma']:
             import lzma
-            return lzma.open(FileProgress(path, fp=open(path, mode=binmode), **kwargs), *args, **kwargs)
+            zopen = lzma.open
         elif self.compression == 'zst':
-            import zstandard
-            return zstandard.open(FileProgress(path, fp=open(path, mode=binmode), **kwargs), *args, **kwargs)
+            zstandard = vd.importExternal('zstandard')
+            zopen = zstandard.open
         else:
             return FileProgress(path, fp=self._path.open(*args, **kwargs), **kwargs)
 
+        if 'w' in kwargs.get('mode', ''):
+            #1159 FileProgress on the outside to close properly when writing
+            return FileProgress(path, fp=zopen(path, **kwargs), **kwargs)
+
+        #1255 FileProgress on the inside to track uncompressed bytes when reading
+        return zopen(FileProgress(path, fp=open(path, mode='rb'), **kwargs), **kwargs)
+
     def __iter__(self):
         with Progress(total=filesize(self)) as prog:
-            with self.open_text(encoding=vd.options.encoding) as fd:
+            with self.open(encoding=vd.options.encoding) as fd:
                 for i, line in enumerate(fd):
                     prog.addProgress(len(line))
                     yield line.rstrip('\n')
-
-    def open_bytes(self, mode='rb'):
-        'Open the file pointed by this path and return a file object in binary mode.'
-        if 'b' not in mode:
-            mode += 'b'
-        return self.open(mode=mode)
 
     def read_bytes(self):
         'Return the entire binary contents of the pointed-to file as a bytes object.'
         with self.open(mode='rb') as fp:
             return fp.read()
+
+    @wraps(pathlib.Path.is_fifo)
+    def is_fifo(self):
+        'Return True if the path is a fifo.'
+        return self._path.is_fifo()
+
+    def is_local(self):
+        'Return True if self.filename refers to a file on the local disk.'
+        return not bool(self.is_url()) and not bool(self.fp) and not bool(self.fptext)
 
     def is_url(self):
         'Return True if the given path appears to be a URL.'
@@ -289,7 +373,7 @@ class Path(os.PathLike):
         return str(self._path)
 
     @wraps(pathlib.Path.stat)
-    @functools.lru_cache()
+    @lru_cache()
     def stat(self, force=False):
         'Return Path.stat() if relevant.'
         try:
@@ -315,10 +399,10 @@ class Path(os.PathLike):
         'Return a sibling Path with *name* as a filename in the same directory.'
         if self.is_url():
             urlparts = list(urlparse(self.given))
-            urlparts[2] = '/'.join(Path(urlparts[2])._parts[1:-1] + [name])
+            urlparts[2] = '/'.join(list(Path(urlparts[2]).parts[1:-1]) + [name])
             return Path(urlunparse(urlparts))
         else:
-            return Path(self._from_parsed_parts(self._drv, self._root, self._parts[:-1] + [name]))
+            return Path(self._from_parsed_parts(self._drv, self._root, list(self.parts[:-1]) + [name]))
 
 
 class RepeatFile:
@@ -331,30 +415,52 @@ class RepeatFile:
 
     def __enter__(self):
         '''Returns a new independent file-like object, sharing the same line cache.'''
-        return RepeatFile(self.iter_lines, lines=self.lines)
+        return self.reopen()
 
     def __exit__(self, a,b,c):
         pass
 
+    def reopen(self):
+        'Return copy of file-like with internal iterator reset.'
+        return RepeatFile(self.iter_lines, lines=self.lines)
+
     def read(self, n=None):
-        r = ''
+        '''Returns a string or bytes object. Unlike the standard read() function, when *n* is given, more than *n* characters/bytes can be returned, and often will.'''
         if n is None:
             n = 10**12  # some too huge number
-        while len(r) < n:
+        r = []
+        size = 0
+        output_type = str; eol = '\n'; joiner = ''
+        while not r or size < n:
             try:
                 s = next(self.iter)
-                r += s + '\n'
+                if not r and isinstance(s, bytes):
+                    output_type = bytes; eol = b'\n'; joiner = b''
+                assert isinstance(s, output_type), (s, output_type)
+                r.append(s)
+                r.append(eol)
+                size += len(s) + len(eol)
             except StopIteration:
                 break  # end of file
-        return r
+        return joiner.join(r)
+
+    def write(self, s):
+        return self.iter_lines.write(s)
 
     def tell(self):
         '''Tells the current position as an opaque line marker.'''
         return self.iter.nextIndex
 
-    def seek(self, n):
+    def seek(self, offset, whence=io.SEEK_SET):
         '''Seek to an already seen opaque line position marker only.'''
-        self.iter.nextIndex = n
+        if whence != io.SEEK_SET and offset != 0:
+            if whence == io.SEEK_CUR:
+                raise io.UnsupportedOperation("can't do nonzero cur-relative seeks")
+            elif whence == io.SEEK_END:
+                raise io.UnsupportedOperation("can't do nonzero end-relative seeks")
+            else:
+                raise ValueError('invalid whence (%s, should be %s, %s or %s)' % (whence, io.SEEK_SET, io.SEEK_CUR, io.SEEK_END))
+        self.iter.nextIndex = offset
 
     def readline(self, size=-1):
         if size != -1:
@@ -398,3 +504,10 @@ class RepeatFileIter:
 
         self.nextIndex += 1
         return r
+
+
+vd.addGlobals(RepeatFile=RepeatFile,
+              Path=Path,
+              modtime=modtime,
+              filesize=filesize,
+              vstat=vstat)

@@ -3,7 +3,7 @@
     - logging of options
     - logging of rows and columns
     - if empty sheet, row or column on cmdlog, executes command on current sheet, row, column
-    - pause, continue, abort
+    - abort
     - test batch mode
         - bin/vd -b -p tests/append.vd
         - bin/vd -p tests/append.vd -b
@@ -16,10 +16,6 @@
     - numerical, boolean and string option
     - sheet-specific and global
     - motd_url
-9. using the pandas loader
-    - select
-    - edit
-    - frequency table
 10. large dataset (311)
 12. Options
     - local + global options should be set appropriately
@@ -62,7 +58,7 @@
             - columns sheet should remain where it is, and the source sheet below gets moved to the top of the other window
         - redo with opening the columns sheet on the other
             - bug
-                - when Shift+Z is done on bottom pane, its second sheet becomes the second sheet of the top stack, isntead of the first sheet of the top stack
+                - when Shift+Z is done on bottom pane, its second sheet becomes the second sheet of the top stack, instead of the first sheet of the top stack
         - test 3
             - Shift+Z with only one file
             - Shift+Z with two panes, each pane's stack only has one file
@@ -87,10 +83,16 @@
 17. Anything new in this release (should it have its own automated test?)
 18. `edit-cell` and then `Ctrl+O` to launch editor.
 19. Save to a non-existent format.
-    - Saves to tsv by default
-    - Save to it a second time, asks for confirmation, if confirm_overwrite=True
+    - Saves to save-filetype by default
+    - If save-filetype is a non-existent format, blocks
+    - test overwrite=y,n,c
 20. Save multiple sheets to a single non-embeddable format
     - save name makes sense
     - fails if not offered a directory
     - succeeds if offered a directory
 21. Test macro-record.
+22. Test `open-row` on an html link: https://hls.gsfc.nasa.gov/data/
+23. That DirSheet requires a commit-sheet before changes on filesystem
+24. Test adding multiple aggregators via palette (+)
+25. time vd -p tests/quit-nosave.vdj  - note down the time. compare to PR #2369
+26. Use the z; command. Then type in a command line like echo "| Ceci n'est pas une pipe"

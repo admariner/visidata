@@ -1,6 +1,6 @@
 import logging
 
-from visidata import VisiData, Sheet, Progress, ColumnItem, anytype
+from visidata import VisiData, Sheet, Progress, ColumnItem, anytype, vd
 
 SASTypes = {
     'string': str,
@@ -9,28 +9,35 @@ SASTypes = {
 
 @VisiData.api
 def open_xpt(vd, p):
-    return XptSheet(p.name, source=p)
+    return XptSheet(p.base_stem, source=p)
 
 @VisiData.api
 def open_sas7bdat(vd, p):
-    return SasSheet(p.name, source=p)
+    return SasSheet(p.base_stem, source=p)
 
 class XptSheet(Sheet):
     def iterload(self):
-        import xport
+        xport = vd.importExternal('xport')
+        xport.v56 = vd.importExternal('xport.v56', 'xport>=3')
         with open(self.source, 'rb') as fp:
-            self.rdr = xport.Reader(fp)
+            self.library = xport.v56.load(fp)
 
             self.columns = []
-            for i, var in enumerate(self.rdr._variables):
-                self.addColumn(ColumnItem(var.name, i, type=float if var.numeric else str))
+            dataset = self.library[list(self.library.keys())[0]]
 
-            yield from self.rdr
+            varnames = dataset.contents.Variable.values
+            types = dataset.contents.Type.values
+
+            for i, (varname, typestr) in enumerate(zip(varnames, types)):
+                self.addColumn(ColumnItem(varname, i, type=float if typestr == 'Numeric' else str))
+
+            for row in dataset.values:
+                yield list(row)
 
 
 class SasSheet(Sheet):
     def iterload(self):
-        import sas7bdat
+        sas7bdat = vd.importExternal('sas7bdat')
         self.dat = sas7bdat.SAS7BDAT(str(self.source), skip_header=True, log_level=logging.CRITICAL)
         self.columns = []
         for col in self.dat.columns:

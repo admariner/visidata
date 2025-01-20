@@ -1,21 +1,38 @@
+import pathlib
 import tarfile
 import zipfile
+import datetime
 from visidata.loaders import unzip_http
 
 from visidata import vd, VisiData, asyncthread, Sheet, Progress, Menu, options
-from visidata import ColumnAttr, Column, date, datetime, Path
+from visidata import ColumnAttr, Column, Path, filesize
+from visidata.type_date import date
+
+@VisiData.api
+def guess_zip(vd, p):
+    if not p.is_url() and zipfile.is_zipfile(p.open_bytes()):
+        return dict(filetype='zip', _likelihood=10)
+
+@VisiData.api
+def guess_tar(vd, p):
+    # an empty file will pass is_tarfile(), but can't be opened by tarfile.open()
+    if filesize(p) == 0:
+        return None
+    if tarfile.is_tarfile(p.open_bytes()):
+        return dict(filetype='tar', _likelihood=10)
 
 @VisiData.api
 def open_zip(vd, p):
-    return vd.ZipSheet(p.name, source=p)
+    return vd.ZipSheet(p.base_stem, source=p)
 
 @VisiData.api
 def open_tar(vd, p):
-    return TarSheet(p.name, source=p)
+    return TarSheet(p.base_stem, source=p)
 
 VisiData.open_tgz = VisiData.open_tar
 VisiData.open_txz = VisiData.open_tar
 VisiData.open_tbz2 = VisiData.open_tar
+VisiData.open_whl = VisiData.open_zip
 
 @VisiData.api
 class ZipSheet(Sheet):
@@ -33,41 +50,76 @@ class ZipSheet(Sheet):
                getter=lambda col, row: datetime.datetime(*row[0].date_time)),
     ]
     nKeys = 2
+    guide = '''# Zip Sheet
+This is a list of files contained in the zipfile {sheet.displaySource}.
+
+Once extracted, files can be loaded with `ENTER`.
+
+Commands:
+
+- `x` to extract current file to current directory
+- `gx` to extract selected files to current directory
+- `zx` to extract current file to a given pathname
+- `gzx`  to extract selected files to given directory
+
+'''
 
     def openZipFile(self, fp, *args, **kwargs):
         '''Use VisiData input to handle password-protected zip files.'''
+        if isinstance(fp, zipfile.ZipFile):
+            zip_open =  fp.open
+        elif isinstance(fp, unzip_http.RemoteZipFile):
+            zip_open = fp._open
         try:
-            return fp.open(*args, **kwargs)
+            return zip_open(*args, **kwargs)
         except RuntimeError as err:
             if 'password required' in err.args[0]:
                 pwd = vd.input(f'{args[0].filename} is encrypted, enter password: ', display=False)
-                return fp.open(*args, **kwargs, pwd=pwd.encode('utf-8'))
-            vd.error(err)
+                return zip_open(*args, **kwargs, pwd=pwd.encode('utf-8'))
+            vd.exceptionCaught(err)
 
     def openRow(self, row):
             fi, zpath = row
             fp = self.openZipFile(self.zfp, fi)
             return vd.openSource(Path(fi.filename, fp=fp, filesize=fi.file_size), filetype=options.filetype)
 
-    @asyncthread
     def extract(self, *rows, path=None):
+        path = path or pathlib.Path('.')
+
+        files = []
+        for row in rows:
+            r, _ = row
+            vd.confirmOverwrite(path/r.filename)  #1452
+            self.extract_async(row)
+
+    def sysopen_row(self, row):
+        'Extract file in row to tempdir and launch $EDITOR.  Modifications will be discarded.'
+        import tempfile
+        with tempfile.TemporaryDirectory() as tempdir:
+            self.zfp.extract(member=row[0], path=tempdir)
+            vd.launchExternalEditorPath(Path(tempdir)/row[0].filename)
+
+    @asyncthread
+    def extract_async(self, *rows, path=None):
+        'Extract rows to *path*, without confirmation.'
         for r, _ in Progress(rows):
-            self.zfp.extractall(members=[r.filename], path=path)
+            self.zfp.extract(member=r.filename, path=path)
             vd.status(f'extracted {r.filename}')
 
     @property
     def zfp(self):
-        if '://' in str(self.source):
-            unzip_http.warning = vd.warning
-            return unzip_http.RemoteZipFile(str(self.source))
+        if not self._zfp:
+            if '://' in str(self.source):
+                unzip_http.warning = vd.warning
+                self._zfp = unzip_http.RemoteZipFile(str(self.source))
+            else:
+                self._zfp = zipfile.ZipFile(str(self.source), 'r')
 
-        return zipfile.ZipFile(str(self.source), 'r')
+        return self._zfp
 
     def iterload(self):
-        with self.zfp as zf:
-            for zi in Progress(zf.infolist()):
-#                yield [zi, zipfile.Path(zf, at=zi.filename)]
-                yield [zi, Path(zi.filename)]
+        for zi in Progress(self.zfp.infolist()):
+            yield [zi, Path(zi.filename)]
 
 
 class TarSheet(Sheet):
@@ -93,10 +145,13 @@ class TarSheet(Sheet):
                 yield ti
 
 
+ZipSheet.init('_zfp', lambda: None, copy=True)
+
 ZipSheet.addCommand('x', 'extract-file', 'extract(cursorRow)', 'extract current file to current directory')
 ZipSheet.addCommand('gx', 'extract-selected', 'extract(*onlySelectedRows)', 'extract selected files to current directory')
 ZipSheet.addCommand('zx', 'extract-file-to', 'extract(cursorRow, path=inputPath("extract to: "))', 'extract current file to given pathname')
 ZipSheet.addCommand('gzx', 'extract-selected-to', 'extract(*onlySelectedRows, path=inputPath("extract %d files to: " % nSelectedRows))', 'extract selected files to given directory')
+ZipSheet.addCommand('Ctrl+O', 'sysopen-row', 'sysopen_row(cursorRow)', 'open $EDITOR with current file (modifications will be discarded)')
 
 vd.addMenu(Menu('File', Menu('Extract',
         Menu('current file', 'extract-file'),

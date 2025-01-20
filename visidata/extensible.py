@@ -8,31 +8,91 @@ class Extensible:
 
     @classmethod
     def init(cls, membername, initfunc=lambda: None, copy=False):
-        'Append equivalent of ``self.<membername> = initfunc()`` to ``<cls>.__init__``.'
-        oldinit = cls.__init__
+        'Prepend equivalent of ``self.<membername> = initfunc()`` to ``<cls>.__init__``.  If *copy* is True, <membername> will be copied when object is copied.'
+
+        def thisclass_hasattr(cls, k):
+            return getattr(cls, k, None) is not getattr(cls.__bases__[0], k, None)
+
+        # must check hasattr first or else this might be parent's __init__
+        oldinit = thisclass_hasattr(cls, '__init__') and getattr(cls, '__init__')
         def newinit(self, *args, **kwargs):
-            oldinit(self, *args, **kwargs)
             if not hasattr(self, membername):  # can be overridden by a subclass
                 setattr(self, membername, initfunc())
-        cls.__init__ = newinit
+            if oldinit:
+                oldinit(self, *args, **kwargs)
+            else:
+                super(cls, self).__init__(*args, **kwargs)
+        cls.__init__ = wraps(oldinit)(newinit) if oldinit else newinit
 
-        oldcopy = cls.__copy__
+        oldcopy = thisclass_hasattr(cls, '__copy__') and getattr(cls, '__copy__')
         def newcopy(self, *args, **kwargs):
-            ret = oldcopy(self, *args, **kwargs)
+            if oldcopy:
+                ret = oldcopy(self, *args, **kwargs)
+            else:
+                ret = super(cls, self).__copy__(*args, **kwargs)
             setattr(ret, membername, getattr(self, membername) if copy and hasattr(self, membername) else initfunc())
             return ret
-        cls.__copy__ = newcopy
+        cls.__copy__ = wraps(oldcopy)(newcopy) if oldcopy else newcopy
+
+    @classmethod
+    def superclasses(cls):
+        yield cls
+        yield from cls.__bases__
+        for b in cls.__bases__:
+            if hasattr(b, 'superclasses'):
+                yield from b.superclasses()
 
     @classmethod
     def api(cls, func):
         oldfunc = getattr(cls, func.__name__, None)
         if oldfunc:
             func = wraps(oldfunc)(func)
+        from visidata import vd
+        func.importingModule = vd.importingModule
         setattr(cls, func.__name__, func)
         return func
 
     @classmethod
+    def before(cls, beforefunc):
+        funcname = beforefunc.__name__
+        oldfunc = getattr(cls, funcname, None)
+        if not oldfunc:
+            setattr(cls, funcname, beforefunc)
+
+        @wraps(oldfunc)
+        def wrappedfunc(*args, **kwargs):
+            beforefunc(*args, **kwargs)
+            return oldfunc(*args, **kwargs)
+
+        setattr(cls,  funcname, wrappedfunc)
+        return wrappedfunc
+
+    @classmethod
+    def after(cls, afterfunc):
+        funcname = afterfunc.__name__
+        oldfunc = getattr(cls, funcname, None)
+        if not oldfunc:
+            setattr(cls, funcname, afterfunc)
+
+        @wraps(oldfunc)
+        def wrappedfunc(*args, **kwargs):
+            r = oldfunc(*args, **kwargs)
+            afterfunc(*args, **kwargs)
+            return r
+
+        setattr(cls,  funcname, wrappedfunc)
+        return wrappedfunc
+
+    @classmethod
     def class_api(cls, func):
+        '''`@Class.class_api` works much like `@Class.api`, but for class methods. This method is used internally but may not be all that useful for plugin and module authors. Note that `@classmethod` must still be provided, and **the order of multiple decorators is crucial**, in that `@<class>.class_api` must come before `@classmethod`:
+
+::
+        @Sheet.class_api
+        @classmethod
+        def addCommand(cls, ...):
+        '''
+
         name = func.__get__(None, dict).__func__.__name__
         oldfunc = getattr(cls, name, None)
         if oldfunc:
@@ -52,11 +112,12 @@ class Extensible:
     @classmethod
     def lazy_property(cls, func):
         'Return ``func()`` on first access and cache result; return cached result thereafter.'
+        name = '_' + func.__name__
+        cls.init(name, lambda: None, copy=False)
         @property
         @wraps(func)
         def get_if_not(self):
-            name = '_' + func.__name__
-            if not hasattr(self, name):
+            if getattr(self, name, None) is None:
                 setattr(self, name, func(self))
             return getattr(self, name)
         setattr(cls, func.__name__, get_if_not)

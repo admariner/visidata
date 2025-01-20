@@ -5,9 +5,6 @@ import functools
 
 from visidata import options, stacktrace, BaseSheet, vd
 
-__all__ = ['forward', 'wrmap', 'wrapply', 'TypedWrapper', 'TypedExceptionWrapper']
-
-vd.option('null_value', None, 'a value to be counted as null', replay=True)
 
 @BaseSheet.api
 def isNullFunc(sheet):
@@ -31,8 +28,14 @@ class TypedWrapper:
     def __len__(self):
         return 0
 
-    def __str__(self):
+    def __repr__(self):
         return '%s(%s)' % (self.type.__name__, ','.join(str(x) for x in self.args))
+
+    def __str__(self):
+        if self.val is None:
+            return ''
+
+        return repr(self)
 
     def __lt__(self, x):
         'maintain sortability; wrapped objects are always least'
@@ -53,8 +56,10 @@ class TypedWrapper:
 
     def __iter__(self):
         return self
+
     def __next__(self):
         raise StopIteration
+
 
 class TypedExceptionWrapper(TypedWrapper):
     def __init__(self, func, *args, exception=None):
@@ -109,3 +114,12 @@ def wrapply(func, *args, **kwargs):
     except Exception as e:
         e.stacktrace = stacktrace()
         return TypedExceptionWrapper(func, *args, exception=e)
+
+
+vd.addGlobals(
+    forward=forward,
+    wrmap=wrmap,
+    wrapply=wrapply,
+    TypedWrapper=TypedWrapper,
+    TypedExceptionWrapper=TypedExceptionWrapper
+)

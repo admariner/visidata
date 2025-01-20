@@ -1,21 +1,27 @@
-from visidata import *
+import collections
+import os
+from copy import copy
 
+from visidata import vd
+from visidata import Sheet, BaseSheet, VisiData, IndexSheet, Path, Progress, TypedExceptionWrapper, TypedWrapper, UNLOADED
 
-vd.option('confirm_overwrite', True, 'whether to prompt for overwrite confirmation on save')
 vd.option('safe_error', '#ERR', 'error string to use while saving', replay=True)
-vd.option('disp_formatter', 'generic', 'formatter to use for display and saving', replay=True)
+vd.option('save_encoding', 'utf-8', 'encoding passed to codecs.open when saving a file', replay=True, help=vd.help_encoding)
 
 @Sheet.api
 def safe_trdict(vs):
     'returns string.translate dictionary for replacing tabs and newlines'
-    if options.safety_first:
+    if vs.options.safety_first:
         delim = vs.options.delimiter
-        return {
+        trdict = {
              0: '', #  strip NUL completely
-    ord(delim): vs.options.tsv_safe_tab, # \t
             10: vs.options.tsv_safe_newline,  # \n
             13: vs.options.tsv_safe_newline,  # \r
         }
+        if not delim or ord(delim) in trdict:
+            vd.fail(f'cannot use delimiter {repr(delim)} with safety_first')
+        trdict[ord(delim)] = vs.options.tsv_safe_tab # \t
+        return trdict
     return {}
 
 
@@ -26,16 +32,16 @@ def iterdispvals(sheet, *cols, format=False):
         cols = sheet.visibleCols
 
     transformers = collections.OrderedDict()  # list of transformers for each column in order
+    trdict = sheet.safe_trdict()
     for col in cols:
         transformers[col] = [ col.type ]
         if format:
             formatMaker = getattr(col, 'formatter_'+(col.formatter or sheet.options.disp_formatter))
             transformers[col].append(formatMaker(col._formatdict))
-        trdict = sheet.safe_trdict()
         if trdict:
             transformers[col].append(lambda v,trdict=trdict: v.translate(trdict))
 
-    options_safe_error = options.safe_error
+    options_safe_error = sheet.options.safe_error
     for r in Progress(sheet.rows):
         dispvals = collections.OrderedDict()  # [col] -> value
         for col, transforms in transformers.items():
@@ -43,7 +49,6 @@ def iterdispvals(sheet, *cols, format=False):
                 dispval = col.getValue(r)
 
             except Exception as e:
-                vd.exceptionCaught(e)
                 dispval = options_safe_error or str(e)
 
             try:
@@ -52,6 +57,9 @@ def iterdispvals(sheet, *cols, format=False):
                         break
                     elif isinstance(dispval, TypedExceptionWrapper):
                         dispval = options_safe_error or str(dispval)
+                        break
+                    elif isinstance(dispval, TypedWrapper):
+                        dispval = ''
                         break
                     else:
                         dispval = t(dispval)
@@ -82,11 +90,11 @@ def getDefaultSaveName(sheet):
             return str(src.with_suffix('')) + '.' + sheet.options.save_filetype
         return str(src)
     else:
-        return sheet.name+'.'+getattr(sheet, 'filetype', options.save_filetype)
+        return sheet.name+'.'+getattr(sheet, 'filetype', sheet.options.save_filetype)
 
 
 @VisiData.api
-def save_cols(vd, cols):
+def saveCols(vd, cols):
     sheet = cols[0].sheet
     vs = copy(sheet)
     vs.columns = list(cols)
@@ -96,30 +104,38 @@ def save_cols(vd, cols):
     else:
         savedcoltxt = '%s columns' % len(cols)
     path = vd.inputPath('save %s to: ' % savedcoltxt, value=vs.getDefaultSaveName())
-    vd.saveSheets(path, vs, confirm_overwrite=options.confirm_overwrite)
+    vd.saveSheets(path, vs)
 
 
 @VisiData.api
-def saveSheets(vd, givenpath, *vsheets, confirm_overwrite=False):
+def saveSheets(vd, givenpath, *vsheets, confirm_overwrite=True):
     'Save all *vsheets* to *givenpath*.'
 
-    filetype = givenpath.ext or options.save_filetype
+    if not vsheets: # blank tuple
+        vd.warning('no sheets to save')
+        return
+    if not givenpath.name:
+        vd.warning('no save path given')
+        return
+
+    unloaded = [ vs for vs in vsheets if vs.rows is UNLOADED ]
+    vd.sync(*vd.ensureLoaded(unloaded))
+
+    filetypes = [givenpath.ext.lower(), vd.options.save_filetype.lower()]
 
     vd.clearCaches()
 
-    savefunc = getattr(vsheets[0], 'save_' + filetype, None) or getattr(vd, 'save_' + filetype, None)
-
-    using_save_filetype = False
+    for ft in filetypes:
+        savefunc = getattr(vsheets[0], 'save_' + ft, None) or getattr(vd, 'save_' + ft, None)
+        if savefunc:
+            filetype = ft
+            break
 
     if savefunc is None:
-        savefunc = getattr(vd, 'save_' + options.save_filetype, None) or vd.fail('no function to save as type %s, set options.save_filetype' % filetype)
-        vd.warning(f'save for {filetype} unavailable, using {options.save_filetype}')
-        using_save_filetype = True
+        vd.fail(f'no function to save as {filetype}')
 
-    if using_save_filetype and givenpath.exists() and confirm_overwrite:
-        vd.confirm("%s already exists. overwrite with %s? " % (givenpath.given, options.save_filetype))
-    elif givenpath.exists() and confirm_overwrite:
-        vd.confirm("%s already exists. overwrite? " % givenpath.given)
+    if confirm_overwrite:
+        vd.confirmOverwrite(givenpath)
 
     vd.status('saving %s sheets to %s as %s' % (len(vsheets), givenpath.given, filetype))
 
@@ -148,19 +164,40 @@ def saveSheets(vd, givenpath, *vsheets, confirm_overwrite=False):
             p = Path((givenpath / vs.name).with_suffix('.'+filetype))
             savefunc(p, vs)
             vs.hasBeenModified = False
+
+        vd.status(f'{givenpath} save finished')  #2157
+
     return vd.execAsync(_savefiles, vsheets, givenpath, savefunc, filetype)
 
 
 @VisiData.api
+def save_zip(vd, p, *vsheets):
+    vd.clearCaches()
+
+    import tempfile
+    import zipfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with zipfile.ZipFile(str(p), 'w', zipfile.ZIP_DEFLATED, allowZip64=True, compresslevel=9) as zfp:
+            for vs in Progress(vsheets):
+                filetype = vs.options.save_filetype
+                tmpp = Path(f'{tmpdir}{vs.name}.{filetype}')
+                savefunc = getattr(vs, 'save_' + filetype, None) or getattr(vd, 'save_' + filetype, None)
+                savefunc(tmpp, vs)
+                zfp.write(tmpp, f'{vs.name}.{vs.options.save_filetype}')
+
+
+@VisiData.api
 def save_txt(vd, p, *vsheets):
-    with p.open_text(mode='w', encoding=vsheets[0].options.encoding) as fp:
+    if len(vsheets) == 1 and vsheets[0].nVisibleCols > 1:  #2173
+        return vd.save_tsv(p, vsheets[0])
+
+    with p.open(mode='w', encoding=vsheets[0].options.save_encoding) as fp:
         for vs in vsheets:
             unitsep = vs.options.delimiter
             rowsep = vs.options.row_delimiter
             for dispvals in vs.iterdispvals(*vs.visibleCols, format=True):
                 fp.write(unitsep.join(dispvals.values()))
                 fp.write(rowsep)
-    vd.status('%s save finished' % p)
 
 
 @BaseSheet.api
@@ -171,9 +208,18 @@ def rootSheet(sheet):
 
     return r
 
-BaseSheet.addCommand('^S', 'save-sheet', 'vd.saveSheets(inputPath("save to: ", value=getDefaultSaveName()), sheet, confirm_overwrite=options.confirm_overwrite)', 'save current sheet to filename in format determined by extension (default .tsv)')
-BaseSheet.addCommand('', 'save-source', 'vd.saveSheets(rootSheet().source, rootSheet(), confirm_overwrite=options.confirm_overwrite)', 'save root sheet to its source')
-BaseSheet.addCommand('g^S', 'save-all', 'vd.saveSheets(inputPath("save all sheets to: "), *vd.stackedSheets, confirm_overwrite=options.confirm_overwrite)', 'save all sheets to given file or directory)')
-IndexSheet.addCommand('g^S', 'save-selected', 'vd.saveSheets(inputPath("save %d sheets to: " % nSelectedRows, value="_".join(getattr(vs, "name", None) or "blank" for vs in selectedRows)), *selectedRows, confirm_overwrite=options.confirm_overwrite)', 'save all selected sheets to given file or directory')
-Sheet.addCommand('', 'save-col', 'save_cols([cursorCol])', 'save current column only to filename in format determined by extension (default .tsv)')
-Sheet.addCommand('', 'save-col-keys', 'save_cols(keyCols + [cursorCol])', 'save key columns and current column to filename in format determined by extension (default .tsv)')
+
+BaseSheet.addCommand('^S', 'save-sheet', 'vd.saveSheets(inputPath("save to: ", value=getDefaultSaveName()), sheet)', 'save current sheet to filename in format determined by extension (default .tsv)')
+BaseSheet.addCommand('', 'save-sheet-really', 'vd.saveSheets(Path(getDefaultSaveName()), sheet, confirm_overwrite=False)', 'save current sheet without asking for filename or confirmation')
+BaseSheet.addCommand('', 'save-source', 'vd.saveSheets(rootSheet().source, rootSheet())', 'save root sheet to its source')
+BaseSheet.addCommand('g^S', 'save-all', 'vd.saveSheets(inputPath("save all sheets to: "), *vd.stackedSheets)', 'save all sheets to given file or directory)')
+IndexSheet.addCommand('g^S', 'save-selected', 'vd.saveSheets(inputPath("save %d sheets to: " % nSelectedRows, value="_".join(getattr(vs, "name", None) or "blank" for vs in selectedRows)), *selectedRows)', 'save all selected sheets to given file or directory')
+Sheet.addCommand('', 'save-col', 'saveCols([cursorCol])', 'save current column only to filename in format determined by extension (default .tsv)')
+Sheet.addCommand('', 'save-col-keys', 'saveCols(keyCols + [cursorCol])', 'save key columns and current column to filename in format determined by extension (default .tsv)')
+
+vd.addMenuItems('''
+    File > Save > current sheet > save-sheet
+    File > Save > all sheets > save-all
+    File > Save > current column > save-col
+    File > Save > keys and current column > save-col-keys
+''')

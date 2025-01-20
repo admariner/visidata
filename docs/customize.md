@@ -2,8 +2,8 @@
 eleventyNavigation:
     key: Customizing VisiData
     order: 12
-Updated: 2022-04-05
-Version: VisiData v2.9
+Updated: 2023-11-18
+Version: VisiData v3.0
 ---
 
 For a primer on configuring VisiData through setting options, see [jsvine's tutorial](https://jsvine.github.io/intro-to-visidata/advanced/configuring-visidata/).
@@ -20,7 +20,7 @@ From within VisiData, type `z Ctrl+H` to open the **Commands Sheet**. This is a 
 
 ### Setting/changing keybindings for existing commands
 
-1. Learn the longname for a command. Longnames are usually 2-3 words, seperated by hyphens. The first word is usually a verb, and the second usually a noun. When a command is executed, its longname appears in the lower right status, next to its keystroke. Alternatively, you can `z Ctrl+H` to open the **Commands Sheet** and discover the longname for the command in question.
+1. Learn the longname for a command. Longnames are usually 2-3 words, separated by hyphens. The first word is usually a verb, and the second usually a noun. When a command is executed, its longname appears in the lower right status, next to its keystroke. Alternatively, you can `z Ctrl+H` to open the **Commands Sheet** and discover the longname for the command in question.
 
 ![longname](/docs/assets/longname.png)
 
@@ -90,8 +90,16 @@ vd.aggregator('irr', np.irr, type=float)
 
 Any numeric aggregator can be added!
 
-Supply a space-separated list of aggreagator names to `options.describe_aggr` in your .visidatarc.
+Supply a space-separated list of aggregator names to `options.describe_aggrs` in your .visidatarc.
 
 ```
 options.describe_aggrs = 'mean stdev irr'
 ```
+
+### Turning off motd {#motd}
+
+By default, the first time each day that VisiData is used, it downloads a single small file of startup messages.
+
+This network request can be turned off by adding `options.motd_url=''` to your `~/.visidatarc`.
+
+If you do decide to turn it off, we encourage you to [donate](https://www.patreon.com/saulpw/posts) to [support VisiData](https://github.com/sponsors/saulpw).

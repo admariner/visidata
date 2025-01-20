@@ -1,7 +1,8 @@
 import textwrap
+import re
 
 from visidata import vd, BaseSheet, options, Sheet, ColumnItem, asyncthread
-from visidata import Column, ColumnItem, vlen
+from visidata import Column, vlen
 from visidata import globalCommand, VisiData
 import visidata
 
@@ -44,6 +45,7 @@ class TextSheet(Sheet):
 
         import tempfile
         with tempfile.NamedTemporaryFile() as temp:
+            temp.close()  #2118
             writelines(sheet, temp.name)
             vd.launchEditor(temp.name, '+%s' % linenum)
             sheet.rows = []
@@ -54,7 +56,47 @@ class TextSheet(Sheet):
 # .source is list of source text lines to 'load'
 # .sourceSheet is Sheet error came from
 class ErrorSheet(TextSheet):
+    columns = [
+        ColumnItem('linenum', 0, type=int, width=0),
+        ColumnItem('error', 1),
+    ]
+    guide = '''
+        # Error Sheet
+This is the traceback for an error.
+- move cursor then {help.commands.sysopen_error}
+- `q` to quit this error sheet.
+    '''
     precious = False
+
+    def sysopen_error(self, col, row):
+        '''Open an external editor for the file relevant to the cursor line
+        in the Error Sheet. If the cursor is on the first line, use the file
+        mentioned at the end of the stack trace'''
+        if self.rows and self.cursorRowIndex == 0:
+            searchidx = len(self.rows) - 1
+        else:
+            searchidx = self.cursorRowIndex
+        pat = re.compile(r'^ +File "(.*)", line (\d+), in ')
+        for _, text in self.rows[searchidx::-1]: # rowdef: [linenum, text]
+            match = pat.search(text)
+            if match:
+                vd.launchEditor(match.group(1), f'+{match.group(2)}')
+                return
+
+    def reload(self):
+        src = self.source or (vd.lastErrors[-1] if vd.lastErrors else [])
+        self.rows = list(enumerate(src))
+
+class ErrorCellSheet(ErrorSheet):
+    columns = [
+        ColumnItem('linenum', 0, type=int, width=0),
+        ColumnItem('cell_error', 1),
+    ]
+    guide = '''# Error Cell Sheet
+This sheet shows the error that occurred when calculating a cell.
+- move cursor then {help.commands.sysopen_error}
+- `q` to quit this error sheet.
+'''
 
 
 class ErrorsSheet(Sheet):
@@ -63,31 +105,36 @@ class ErrorsSheet(Sheet):
         ColumnItem('lastline', -1)
     ]
     def reload(self):
-        self.rows = self.source
+        self.rows = self.source or vd.lastErrors
 
     def openRow(self, row):
         return ErrorSheet(source=self.cursorRow)
 
-@VisiData.property
+@VisiData.lazy_property
 def allErrorsSheet(self):
-    return ErrorsSheet("errors_all", source=vd.lastErrors)
+    return ErrorsSheet("errors_all")
 
-@VisiData.property
+@VisiData.lazy_property
 def recentErrorsSheet(self):
-    error = vd.lastErrors[-1] if vd.lastErrors else ''
-    return ErrorSheet("errors_recent", source=error)
+    return ErrorSheet("errors_recent")
 
 
 
-BaseSheet.addCommand('^E', 'error-recent', 'vd.lastErrors and vd.push(recentErrorsSheet) or status("no error")', 'view traceback for most recent error')
+BaseSheet.addCommand('^E', 'error-recent', 'recentErrorsSheet.reload(); vd.push(recentErrorsSheet) if vd.lastErrors else status("no error")', 'view traceback for most recent error')
 BaseSheet.addCommand('g^E', 'errors-all', 'vd.push(vd.allErrorsSheet)', 'view traceback for most recent errors')
 
-Sheet.addCommand(None, 'view-cell', 'vd.push(ErrorSheet("%s[%s].%s" % (name, cursorRowIndex, cursorCol.name), sourceSheet=sheet, source=cursorDisplay.splitlines()))', 'view contents of current cell in a new sheet'),
-Sheet.addCommand('z^E', 'error-cell', 'vd.push(ErrorSheet(sheet.name+"_cell_error", sourceSheet=sheet, source=getattr(cursorCell, "error", None) or fail("no error this cell")))', 'view traceback for error in current cell')
+Sheet.addCommand('z^E', 'error-cell', 'vd.push(ErrorCellSheet(sheet.name+"_cell_error", sourceSheet=sheet, source=getattr(cursorCell, "error", None) or fail("no error this cell")))', 'view traceback for error in current cell')
 
 TextSheet.addCommand('^O', 'sysopen-sheet', 'sheet.sysopen(sheet.cursorRowIndex)', 'open copy of text sheet in $EDITOR and reload on exit')
 
+ErrorSheet.addCommand('Enter', 'sysopen-error', 'sysopen_error(cursorCol, cursorRow)', 'open traceback line in $EDITOR')
 
-TextSheet.class_options.save_filetype = 'txt'
+TextSheet.options.save_filetype = 'txt'
 
-vd.addGlobals({'TextSheet': TextSheet, 'ErrorSheet': ErrorSheet})
+vd.addGlobals({'TextSheet': TextSheet, 'ErrorSheet': ErrorSheet, 'ErrorCellSheet': ErrorCellSheet})
+
+vd.addMenuItems('''
+    View > Errors > recent > error-recent
+    View > Errors > all > errors-all
+    View > Errors > in cell > error-cell
+''')

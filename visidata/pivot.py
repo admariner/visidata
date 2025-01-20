@@ -1,5 +1,8 @@
 import collections
-from visidata import *
+from copy import copy
+from visidata import ScopedSetattr, Column, Sheet, asyncthread, Progress, forward, wrapply, INPROGRESS
+from visidata import vlen, vd, date, setitem, anytype
+import visidata
 
 
 # discrete_keys = tuple of formatted discrete keys that group the row
@@ -8,10 +11,10 @@ from visidata import *
 # pivotrows is { pivot_values: list(source.rows in group with pivot_values) }
 PivotGroupRow = collections.namedtuple('PivotGroupRow', 'discrete_keys numeric_key sourcerows pivotrows'.split())
 
-def Pivot(source, groupByCols, pivotCols):
+def makePivot(source, groupByCols, pivotCols):
     return PivotSheet('',
-            groupByCols,
-            pivotCols,
+            groupByCols=groupByCols,
+            pivotCols=pivotCols,
             source=source)
 
 def makeErrorKey(col):
@@ -23,11 +26,14 @@ def makeErrorKey(col):
 def formatRange(col, numeric_key):
     a, b = numeric_key
     nankey = makeErrorKey(col)
+    if b is None:
+        return a
     if a is nankey and b is nankey:
         return '#ERR'
     elif a == b:
         return col.format(a)
     return ' - '.join(col.format(x) for x in numeric_key)
+
 
 class RangeColumn(Column):
     def __init__(self, *args, **kwargs):
@@ -42,20 +48,39 @@ class RangeColumn(Column):
             return None
         return formatRange(self.origcol, typedval)
 
+
+class AggrColumn(Column):
+    def calcValue(col, row):
+        if col.sheet.loading:
+            return visidata.INPROGRESS
+        return col.aggregator.aggregate(col.origCol, row.sourcerows)
+
+
+def makeAggrColumn(aggcol, aggregator):
+    aggname = '%s_%s' % (aggcol.name, aggregator.name)
+
+    return AggrColumn(aggname,
+                  type=aggregator.type or aggcol.type,
+                  fmtstr=aggcol.fmtstr,
+                  origCol=aggcol,
+                  aggregator=aggregator)
+
+
 class PivotSheet(Sheet):
     'Summarize key columns in pivot table and display as new sheet.'
     rowtype = 'grouped rows'  # rowdef: PivotGroupRow
-    def __init__(self, name, groupByCols, pivotCols, **kwargs):
-        super().__init__(name, **kwargs)
 
-        self.pivotCols = pivotCols  # whose values become columns
-        self.groupByCols = groupByCols  # whose values become rows
+    def __init__(self, *names, groupByCols=[], pivotCols=[], **kwargs):
+        super().__init__(*names,
+                pivotCols=pivotCols, # whose values become columns
+                groupByCols=groupByCols,  # whose values become rows
+                **kwargs)
 
     def isNumericRange(self, col):
         return vd.isNumeric(col) and self.source.options.numeric_binning
 
-    def initCols(self):
-        self.columns = []
+    def resetCols(self):
+        super().resetCols()
 
         # add key columns (grouped by)
         for colnum, c in enumerate(self.groupByCols):
@@ -89,12 +114,10 @@ class PivotSheet(Sheet):
         vs.rows = row.pivotrows.get(col.aggvalue, [])
         return vs
 
-    def reload(self):
-        self.initCols()
-
+    def loader(self):
         # two different threads for better interactive display
-        self.addAggregateCols()
-        self.groupRows()
+        vd.sync(self.addAggregateCols(),
+                self.groupRows())
 
     @asyncthread
     def addAggregateCols(self):
@@ -116,12 +139,7 @@ class PivotSheet(Sheet):
         if not self.pivotCols:
             for aggcol, aggregatorlist in aggcols.items():
                 for aggregator in aggregatorlist:
-                    aggname = '%s_%s' % (aggcol.name, aggregator.name)
-
-                    c = Column(aggname,
-                                type=aggregator.type or aggcol.type,
-                                fmtstr=aggcol.fmtstr,
-                                getter=lambda col,row,aggcol=aggcol,agg=aggregator: agg(aggcol, row.sourcerows))
+                    c = makeAggrColumn(aggcol, aggregator)
                     self.addColumn(c)
 
         # add pivoted columns
@@ -157,17 +175,18 @@ class PivotSheet(Sheet):
                         c = Column(colname,
                                     type=aggregator.type or aggcol.type,
                                     aggvalue=value,
-                                    getter=lambda col,row,aggcol=aggcol,agg=aggregator: agg(aggcol, row.pivotrows.get(col.aggvalue, [])))
+                                    getter=lambda col,row,aggcol=aggcol,agg=aggregator: agg.aggregate(aggcol, row.pivotrows.get(col.aggvalue, [])))
                         self.addColumn(c)
 
 #                    if aggregator.name != 'count':  # already have count above
 #                        c = Column('Total_' + aggcol.name,
 #                                    type=aggregator.type or aggcol.type,
-#                                    getter=lambda col,row,aggcol=aggcol,agg=aggregator: agg(aggcol, row.sourcerows))
+#                                    getter=lambda col,row,aggcol=aggcol,agg=aggregator: agg.aggregate(aggcol, row.sourcerows))
 #                        self.addColumn(c)
 
     @asyncthread
     def groupRows(self, rowfunc=None):
+      with ScopedSetattr(self, 'loading', True):
         self.rows = []
 
         discreteCols = [c for c in self.groupByCols if not self.isNumericRange(c)]
@@ -182,13 +201,16 @@ class PivotSheet(Sheet):
         if numericCols:
             nbins = self.source.options.histogram_bins or int(len(self.source.rows) ** (1./2))
             vals = tuple(numericCols[0].getValues(self.source.rows))
-            minval = min(vals)
-            maxval = max(vals)
+            minval = min(vals) if vals else 0
+            maxval = max(vals) if vals else 0
             width = (maxval - minval)/nbins
 
             if width == 0:
-                # only one value (and maybe errors)
-                numericBins = [(minval, maxval)]
+                if vals:
+                    # only one value
+                    numericBins = [(minval, maxval)]
+                else:
+                    numericBins = []
             elif (numericCols[0].type in (int, vlen) and nbins > (maxval - minval)) or (width == 1):
                 # (more bins than int vals) or (if bins are of width 1), just use the vals as bins
                 degenerateBinning = True
@@ -218,25 +240,29 @@ class PivotSheet(Sheet):
             if numericCols:
                 try:
                     val = numericCols[0].getValue(sourcerow)
-                    if val is not None:
-                        val = numericCols[0].type(val)
-                    if not width:
-                        binidx = 0
-                    elif degenerateBinning:
-                        # in degenerate binning, each val has its own bin
-                        binidx = numericBins.index((val, val))
+                    val = wrapply(numericCols[0].type, val)
+                    if not val:
+                        groupRow = numericGroupRows.get(str(val), None)
                     else:
-                        binidx = int((val-minval)//width)
-                    groupRow = numericGroupRows[formatRange(numericCols[0], numericBins[min(binidx, nbins-1)])]
+                        if not width:
+                            binidx = 0
+                        elif degenerateBinning:
+                            # in degenerate binning, each val has its own bin
+                            binidx = numericBins.index((val, val))
+                        else:
+                            binidx = int((val-minval)//width)
+                        groupRow = numericGroupRows[formatRange(numericCols[0], numericBins[min(binidx, nbins-1)])]
                 except Exception as e:
-                    # leave in main/error bin
-                    pass
+                    vd.exceptionCaught(e)
 
             # add the main bin if no numeric bin (error, or no numeric cols)
             if groupRow is None:
-                nankey = makeErrorKey(numericCols[0]) if numericCols else 0
-                groupRow = PivotGroupRow(discreteKeys, (nankey, nankey), [], {})
-                groups[formattedDiscreteKeys] = (numericGroupRows, groupRow)
+                if numericCols:
+                    groupRow = PivotGroupRow(discreteKeys, val, [], {})
+                    numericGroupRows[str(val)] = groupRow
+                else:
+                    groupRow = PivotGroupRow(discreteKeys, (0, 0), [], {})
+                    groups[formattedDiscreteKeys] = (numericGroupRows, groupRow)
                 self.addRow(groupRow)
 
             # add the sourcerow to its all bin
@@ -253,14 +279,36 @@ class PivotSheet(Sheet):
             if rowfunc:
                 rowfunc(groupRow)
 
+    def afterLoad(self):
+        super().afterLoad()
+
         # automatically add cache to all columns now that everything is binned
         for c in self.nonKeyVisibleCols:
-            c.setCache(True)
+            if isinstance(c, AggrColumn):
+                c.setCache(True)
 
 
-Sheet.addCommand('W', 'pivot', 'vd.push(Pivot(sheet, keyCols, [cursorCol]))', 'open Pivot Table: group rows by key column and summarize current column')
+@PivotSheet.api
+def addcol_aggr(sheet, col):
+    hasattr(col, 'origCol') or vd.fail('not an aggregation column')
+    for agg_choice in vd.chooseAggregators():
+        agg_or_list = vd.aggregators[agg_choice]
+        aggs = agg_or_list if isinstance(agg_or_list, list) else [agg_or_list]
+        for agg in aggs:
+            sheet.addColumnAtCursor(makeAggrColumn(col.origCol, vd.aggregators[agg]))
 
-vd.addGlobals({
-    'Pivot': Pivot,
-    'PivotGroupRow': PivotGroupRow,
-})
+
+Sheet.addCommand('W', 'pivot', 'vd.push(makePivot(sheet, keyCols, [cursorCol]))', 'open Pivot Table: group rows by key column and summarize current column')
+
+PivotSheet.addCommand('', 'addcol-aggr', 'addcol_aggr(cursorCol)', 'add aggregation column from source of current column')
+
+vd.addGlobals(
+    makePivot=makePivot,
+    PivotSheet=PivotSheet,
+    PivotGroupRow=PivotGroupRow,
+)
+
+vd.addMenuItems('''
+    Column > Add column > aggregator > addcol-aggr
+    Data > Pivot > pivot
+''')

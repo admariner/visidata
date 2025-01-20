@@ -1,8 +1,37 @@
-from visidata import *
+from copy import copy
 
-vd.option('color_add_pending', 'green', 'color for rows pending add')
-vd.option('color_change_pending', 'reverse yellow', 'color for cells pending modification')
-vd.option('color_delete_pending', 'red', 'color for rows pending delete')
+from visidata import vd, VisiData, asyncthread
+from visidata import Sheet, RowColorizer, CellColorizer, Column, BaseSheet, Progress
+
+vd.theme_option('color_add_pending', 'green', 'color for rows pending add')
+vd.theme_option('color_change_pending', 'reverse yellow', 'color for cells pending modification')
+vd.theme_option('color_delete_pending', 'red', 'color for rows pending delete')
+vd.option('overwrite', 'c', 'overwrite existing files {y=yes|c=confirm|n=no}')
+
+vd.optalias('readonly', 'overwrite', 'n')
+vd.optalias('ro', 'overwrite', 'n')
+vd.optalias('y', 'overwrite', 'y')
+
+
+@VisiData.api
+def couldOverwrite(vd) -> bool:
+    'Return True if overwrite might be allowed.'
+    return vd.options.overwrite.startswith(('y','c'))
+
+
+@VisiData.api
+def confirmOverwrite(vd, path, msg:str=''):
+    'Fail if file exists and overwrite not allowed.'
+    if path is None or path.exists():
+        msg = msg or f'{path.given} exists. overwrite? '
+        ow = vd.options.overwrite
+        if ow.startswith('c'):  # confirm
+            vd.confirm(msg)
+        elif ow.startswith('y'):  # yes/always
+            pass
+        else: #1805  empty/no/never/readonly
+            vd.fail('overwrite disabled')
+    return True
 
 # deferred cached
 @Sheet.lazy_property
@@ -19,7 +48,7 @@ def _deferredDels(sheet):
 
 Sheet.colorizers += [
         RowColorizer(9, 'color_add_pending', lambda s,c,r,v: s.rowid(r) in s._deferredAdds),
-        CellColorizer(8, 'color_change_pending', lambda s,c,r,v: s.isChanged(c, r)),
+        CellColorizer(8, 'color_change_pending', lambda s,c,r,v: c and (r is not None) and s.isChanged(c, r)),
         RowColorizer(9, 'color_delete_pending', lambda s,c,r,v: s.isDeleted(r)),
         ]
 
@@ -36,7 +65,7 @@ def rowAdded(self, row):
     self._deferredAdds[self.rowid(row)] = row
     def _undoRowAdded(sheet, row):
         if sheet.rowid(row) not in sheet._deferredAdds:
-            vd.warning('cannot undo to before commit')
+            vd.warning('cannot undo row addition after a commit')
             return
         del sheet._deferredAdds[sheet.rowid(row)]
     vd.addUndo(_undoRowAdded, self, row)
@@ -58,7 +87,7 @@ def cellChanged(col, row, val):
             if oldval == col.getSourceValue(row):
                 # if we have reached the original value, remove from defermods entirely
                 if col.sheet.rowid(row) not in col.sheet._deferredMods:
-                    vd.warning('cannot undo to before commit')
+                    vd.warning('cannot undo cell change after a commit')
                     return
                 del col.sheet._deferredMods[col.sheet.rowid(row)]
             else:
@@ -76,7 +105,7 @@ def rowDeleted(self, row):
     self.unselectRow(row)
     def _undoRowDeleted(sheet, row):
         if sheet.rowid(row) not in sheet._deferredDels:
-            vd.warning('cannot undo to before commit')
+            vd.warning('cannot undo row deletion after a commit')
             return
         del sheet._deferredDels[sheet.rowid(row)]
     vd.addUndo(_undoRowDeleted, self, row)
@@ -88,9 +117,9 @@ def addRows(sheet, rows, index=None, undo=True):
     'Add *rows* after row at *index*.'
     addedRows = {}
     if index is None: index=len(sheet.rows)
-    for row in Progress(rows, gerund='adding'):
+    for i, row in enumerate(Progress(rows, gerund='adding')):
         addedRows[sheet.rowid(row)] = row
-        sheet.addRow(row, index=index+1)
+        sheet.addRow(row, index=index+i+1)
 
         if sheet.defer:
             sheet.rowAdded(row)
@@ -136,8 +165,11 @@ def deleteBy(sheet, func, commit=False, undo=True):
             if r is newCursorRow:
                 sheet.cursorRowIndex = len(sheet.rows)-1
         else:
-            sheet.deleteSourceRow(r)
-            ndeleted += 1
+            try:
+                sheet.commitDeleteRow(r)
+                ndeleted += 1
+            except Exception as e:
+                vd.exceptionCaught(e)
 
     if undo:
         vd.addUndo(setattr, sheet, 'rows', oldrows)
@@ -176,17 +208,30 @@ def getSourceValue(col, row):
 @Sheet.api
 def commitAdds(self):
     'Return the number of rows that have been marked for deferred add-row. Clear the marking.'
-    nadded = len(self._deferredAdds.values())
-    if nadded:
-        vd.status('added %s %s' % (nadded, self.rowtype))
+    nadded = 0
+    nerrors = 0
+    for row in self._deferredAdds.values():
+        try:
+            self.commitAddRow(row)
+            nadded += 1
+        except Exception as e:
+            vd.exceptionCaught(e)
+            nerrors += 1
+
+    if nadded or nerrors:
+        vd.status(f'added {nadded} {self.rowtype} ({nerrors} errors)')
+
     self._deferredAdds.clear()
     return nadded
 
+
 @Sheet.api
-def commitMods(self):
-    'Return the number of modifications (that are not deferred deletes or adds) that been marked for defer mod. Change value to mod for row in col. Clear the marking.'
+def commitMods(sheet):
+    'Commit all deferred modifications (that are not from rows added or deleted in this commit.  Return number of cells changed.'
+    _, deferredmods, _ = sheet.getDeferredChanges()
+
     nmods = 0
-    for row, rowmods in self._deferredMods.values():
+    for row, rowmods in deferredmods.values():
         for col, val in rowmods.items():
             try:
                 col.putValue(row, val)
@@ -194,7 +239,7 @@ def commitMods(self):
             except Exception as e:
                 vd.exceptionCaught(e)
 
-    self._deferredMods.clear()
+    sheet._deferredMods.clear()
     return nmods
 
 @Sheet.api
@@ -206,19 +251,24 @@ def commitDeletes(self):
         vd.status('deleted %s %s' % (ndeleted, self.rowtype))
     return ndeleted
 
+
 @Sheet.api
-def deleteSourceRow(sheet, row):
-    pass
+def commitAddRow(self, row):
+    'To commit an added row.  Override per sheet type.'
+
+
+@Sheet.api
+def commitDeleteRow(self, row):
+    'To commit a deleted row.  Override per sheet type.'
+
 
 @asyncthread
 @Sheet.api
 def putChanges(sheet):
-    'Commit changes to ``sheet.source``. May overwrite source completely without confirmation.  Overrideable.'
+    'Commit changes to ``sheet.source``. May overwrite source completely without confirmation.  Overridable.'
     sheet.commitAdds()
     sheet.commitMods()
     sheet.commitDeletes()
-
-    vd.saveSheets(Path(sheet.source), sheet, confirm_overwrite=False)
 
     # clear after save, to ensure cstr (in commit()) is aware of deletes
     sheet._deferredDels.clear()
@@ -268,10 +318,8 @@ def commit(sheet, *rows):
 
     adds, mods, deletes = sheet.getDeferredChanges()
     cstr = sheet.changestr(adds, mods, deletes)
-    path = sheet.source
 
-    if sheet.options.confirm_overwrite:
-        vd.confirm('really %s? ' % cstr)
+    vd.confirmOverwrite(sheet.rootSheet().source, 'really ' + cstr + '? ')
 
     sheet.putChanges()
     sheet.hasBeenModified = False
@@ -282,8 +330,16 @@ def new_rows(sheet, n):
     return [sheet.newRow() for i in range(n)]
 
 Sheet.addCommand('a', 'add-row', 'addRows([newRow()], index=cursorRowIndex); cursorDown(1)', 'append a blank row')
-Sheet.addCommand('ga', 'add-rows', 'n=int(input("add rows: ", value=1)); addRows(new_rows(n), index=cursorRowIndex); cursorDown(1)', 'append N blank rows')
-Sheet.addCommand('za', 'addcol-new', 'addColumnAtCursor(SettableColumn(input("column name: "))); cursorRight(1)', 'append an empty column')
-Sheet.addCommand('gza', 'addcol-bulk', 'addColumnAtCursor(*(SettableColumn() for c in range(int(input("add columns: "))))); cursorRight(1)', 'append N empty columns')
+Sheet.addCommand('ga', 'add-rows', 'n=int(input("add # rows: ", value=1)); addRows(new_rows(n), index=cursorRowIndex); cursorDown(1)', 'append N blank rows')
+Sheet.addCommand('za', 'addcol-new', 'addColumnAtCursor(SettableColumn(input("column name: ")))', 'append an empty column')
+Sheet.addCommand('gza', 'addcol-bulk', 'addColumnAtCursor(*(SettableColumn() for c in range(int(input("add columns: ")))))', 'append N empty columns')
 
 Sheet.addCommand('z^S', 'commit-sheet', 'commit()', 'commit changes back to source.  not undoable!')
+
+vd.addMenuItems('''
+    File > Save > changes to source > commit-sheet
+    Row > Add > one row
+    Row > Add > multiple rows
+    Column > Add column > empty > one column > addcol-new
+    Column > Add column > empty > multiple columns > addcol-bulk
+''')

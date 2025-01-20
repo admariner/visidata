@@ -1,8 +1,7 @@
 import os
 
 import visidata
-from visidata import Extensible, VisiData, vd, EscapeException, cleanName
-from unittest import mock
+from visidata import Extensible, VisiData, vd, EscapeException, MissingAttrFormatter, AttrDict
 
 
 UNLOADED = tuple()  # sentinel for a sheet not yet loaded for the first time
@@ -19,11 +18,19 @@ class LazyChainMap:
                 if k not in self.objs:
                     self.objs[k] = obj
 
+    def __iter__(self):
+        return iter(self.objs)
+
     def __contains__(self, k):
         return k in self.objs
 
     def keys(self):
         return list(self.objs.keys())  # sum(set(dir(obj)) for obj in self.objs))
+
+    def get(self, key, default=None):
+        if key in self.locals:
+            return self.locals[key]
+        return self.objs.get(key, default)
 
     def clear(self):
         self.locals.clear()
@@ -60,6 +67,10 @@ class DrawablePane(Extensible):
         'Width of the current sheet window, in single-width characters.'
         return self._scr.getmaxyx()[1] if self._scr else 80
 
+    @property
+    def currow(self):
+        return None
+
     def execCommand2(self, cmd, vdglobals=None):
         "Execute `cmd` with `vdglobals` as globals and this sheet's attributes as locals.  Return True if user cancelled."
 
@@ -73,6 +84,19 @@ class DrawablePane(Extensible):
             return True
 
 
+class _dualproperty:
+    'Return *obj_method* or *cls_method* depending on whether property is on instance or class.'
+    def __init__(self, obj_method, cls_method):
+        self._obj_method = obj_method
+        self._cls_method = cls_method
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self._cls_method(objtype)
+        else:
+            return self._obj_method(obj)
+
+
 class BaseSheet(DrawablePane):
     'Base class for all sheet types.'
     _rowtype = object    # callable (no parms) that returns new empty item
@@ -80,24 +104,24 @@ class BaseSheet(DrawablePane):
     rowtype = 'objects'  # one word, plural, describing the items
     precious = True      # False for a few discardable metasheets
     defer = False        # False for not deferring changes until save
+    guide = ''           # default to show in sidebar
 
-    @visidata.classproperty
-    def class_options(cls):
-        return vd.OptionsObject(vd._options, obj=cls)
-
-    @property
-    def options(self):
+    def _obj_options(self):
         return vd.OptionsObject(vd._options, obj=self)
 
-    def __init__(self, *names, **kwargs):
+    def _class_options(cls):
+        return vd.OptionsObject(vd._options, obj=cls)
+
+    class_options = options = _dualproperty(_obj_options, _class_options)
+
+    def __init__(self, *names, rows=UNLOADED, **kwargs):
         self._name = None   # initial cache value necessary for self.options
-        self.names = names
-        self.name = self.options.name_joiner.join(str(x) for x in self.names)
+        self._names = []
+        self.loading = False
+        self.names = list(names)
         self.source = None
-        self.rows = UNLOADED      # list of opaque objects
-        self._scr = mock.MagicMock(__bool__=mock.Mock(return_value=False))  # disable curses in batch mode
-        self.mouseX = 0
-        self.mouseY = 0
+        self.rows = rows      # list of opaque objects
+        self._scr = None
         self.hasBeenModified = False
 
         super().__init__(**kwargs)
@@ -136,6 +160,14 @@ class BaseSheet(DrawablePane):
         return self.name
 
     @property
+    def rows(self):
+        return self._rows
+
+    @rows.setter
+    def rows(self, rows):
+        self._rows = rows
+
+    @property
     def nRows(self):
         'Number of rows on this sheet.  Override in subclass.'
         return 0
@@ -147,11 +179,26 @@ class BaseSheet(DrawablePane):
             return vs in self.source
         return False
 
-    def execCommand(self, cmd, vdglobals=None, keystrokes=None):
-        cmd = self.getCommand(cmd or keystrokes)
+    @property
+    def displaySource(self):
+        if isinstance(self.source, BaseSheet):
+            return f'the *{self.source}* sheet'
+
+        if isinstance(self.source, (list, tuple)):
+            if len(self.source) == 1:
+                return f'the **{self.source[0]}** sheet'
+            return f'{len(self.source)} sheets'
+
+        return f'**{self.source}**'
+
+    def execCommand(self, longname, vdglobals=None, keystrokes=None):
+        if ' ' in longname:
+            cmd, arg = longname.split(' ', maxsplit=1)
+            vd.injectInput(arg)
+
+        cmd = self.getCommand(longname or keystrokes)
         if not cmd:
-            if keystrokes:
-                vd.status('no command for %s' % keystrokes)
+            vd.fail('no command for %s' % (longname or keystrokes))
             return False
 
         escaped = False
@@ -165,24 +212,29 @@ class BaseSheet(DrawablePane):
         try:
             for hookfunc in vd.beforeExecHooks:
                 hookfunc(self, cmd, '', keystrokes)
-            vd.debug(cmd.longname)
             escaped = super().execCommand2(cmd, vdglobals=vdglobals)
         except Exception as e:
             vd.debug(cmd.execstr)
             err = vd.exceptionCaught(e)
             escaped = True
 
-        try:
-            if vd.cmdlog:
-                # sheet may have changed
-                vd.cmdlog.afterExecSheet(vd.activeSheet, escaped, err)
-        except Exception as e:
-            vd.exceptionCaught(e)
+        if vd.cmdlog:
+            # sheet may have changed
+            vd.callNoExceptions(vd.cmdlog.afterExecSheet, vd.activeSheet, escaped, err)
 
-        self.checkCursorNoExceptions()
+        vd.callNoExceptions(self.checkCursor)
 
         vd.clearCaches()
+
+        for t in self.currentThreads:
+            if not hasattr(t, 'lastCommand'):
+                t.lastCommand = True
+
         return escaped
+
+    @property
+    def lastCommandThreads(self):
+        return [t for t in self.currentThreads if getattr(t, 'lastCommand', None)]
 
     @property
     def names(self):
@@ -190,8 +242,10 @@ class BaseSheet(DrawablePane):
 
     @names.setter
     def names(self, names):
+        if self._names:
+            vd.addUndo(setattr, self, 'names', self._names)
         self._names = names
-        self.name = self.options.name_joiner.join(self.maybeClean(str(x)) for x in self._names)
+        self._name = self.options.name_joiner.join(self.maybeClean(str(x)) for x in self._names)
 
     @property
     def name(self):
@@ -202,12 +256,12 @@ class BaseSheet(DrawablePane):
     def name(self, name):
         'Set name without spaces.'
         if self._names:
-            vd.addUndo(setattr, self, '_names', self._names)
+            vd.addUndo(setattr, self, 'names', self._names)
         self._name = self.maybeClean(str(name))
+        self._names = [self._name]
 
     def maybeClean(self, s):
-        if self.options.clean_names:
-            s = cleanName(s)
+        'stub'
         return s
 
     def recalc(self):
@@ -215,10 +269,8 @@ class BaseSheet(DrawablePane):
         pass
 
     def refresh(self):
-        'Clear the terminal screen and let the next draw cycle redraw everything.'
-        if self._scr:
-            self._scr.clear()
-            self._scr.refresh()
+        'Recalculate any internal state needed for `draw()`.  Overridable.'
+        pass
 
     def ensureLoaded(self):
         'Call ``reload()`` if not already loaded.'
@@ -232,32 +284,21 @@ class BaseSheet(DrawablePane):
 
     @property
     def cursorRow(self):
-        'The row object at the row cursor.  Overrideable.'
+        'The row object at the row cursor.  Overridable.'
         return None
 
     def checkCursor(self):
-        'Check cursor and fix if out-of-bounds.  Overrideable.'
+        'Check cursor and fix if out-of-bounds.  Overridable.'
         pass
-
-    def checkCursorNoExceptions(self):
-        try:
-            return self.checkCursor()
-        except Exception as e:
-            vd.exceptionCaught(e)
 
     def evalExpr(self, expr, **kwargs):
         'Evaluate Python expression *expr* in the context of *kwargs* (may vary by sheet type).'
-        return eval(expr, vd.getGlobals(), None)
+        return eval(expr, vd.getGlobals(), dict(sheet=self))
 
-    @property
-    def sidebar(self):
-        'Default implementation just returns set value.  Overrideable.'
-        return self._sidebar
+    def formatString(self, fmt, **kwargs):
+        'Return formatted string with *sheet* and *vd* accessible to expressions.  Missing expressions return empty strings instead of error.'
+        return MissingAttrFormatter().format(fmt, sheet=self, vd=vd, **kwargs)
 
-    @sidebar.setter
-    def sidebar(self, v):
-        'Default implementation just sets value.  Overrideable.'
-        self._sidebar = v
 
 
 @VisiData.api
@@ -265,10 +306,11 @@ def redraw(vd):
     'Clear the terminal screen and let the next draw cycle recreate the windows and redraw everything.'
     for vs in vd.sheets:
         vs._scr = None
-    vd.scrFull.clear()
-    vd.win1.clear()
-    vd.win2.clear()
-    vd.setWindows(vd.scrFull)
+    if vd.win1: vd.win1.clear()
+    if vd.win2: vd.win2.clear()
+    if vd.scrFull:
+        vd.scrFull.clear()
+        vd.setWindows(vd.scrFull)
 
 
 @VisiData.property
@@ -276,7 +318,7 @@ def sheet(self):
     return self.activeSheet
 
 @VisiData.api
-def isLongname(self, ks):
+def isLongname(self, ks:str):
     'Return True if *ks* is a longname.'
     return ('-' in ks) and (ks[-1] != '-') or (len(ks) > 3 and ks.islower())
 

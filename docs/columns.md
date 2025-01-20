@@ -94,10 +94,10 @@ Some types have an option for their default display formatting.
 
 Type      Option            Default
 --------- ----------------  --------
-int       disp_int_fmt      {:.0f}
-float     disp_float_fmt    {:.02f}
-currency  disp_currency_fmt %0.2f
-date      disp_date_fmt     %Y-%m-%d
+int       `disp_int_fmt`      `{:.0f}`
+float     `disp_float_fmt`    `{:.02f}`
+currency  `disp_currency_fmt` `%0.2f`
+date      `disp_date_fmt`     `%Y-%m-%d`
 
 Ways to adjust the display formatting:
 
@@ -108,8 +108,8 @@ Ways to adjust the display formatting:
 
 There are several formatting styles offered:
 
-* Formatting that starts with `'%'` (e.g. *%0.2f*) will use [locale.format_string()](https://docs.python.org/3.6/library/locale.html#locale.format_string).
-* Otherwise (e.g. *{:.02f}*), formatting will be passed to Python's [string.format()](https://docs.python.org/3/library/string.html#custom-string-formatting).
+* Formatting that starts with `'%'` (e.g. `%0.2f`) will use [locale.format_string()](https://docs.python.org/3.6/library/locale.html#locale.format_string).
+* Otherwise (e.g. `{:.02f}`), formatting will be passed to Python's [string.format()](https://docs.python.org/3/library/string.html#custom-string-formatting).
 * Date fmtstr are passed to [strftime](https://strftime.org/).
 
 The default for currency uses `locale.format_string()`. The default for int/float/date use `string.format()`.
@@ -119,17 +119,36 @@ The default for currency uses `locale.format_string()`. The default for int/floa
 1. Set a column to a numeric type by pressing `#` (int), `%` (float), or `$` (currency).
 2. Press `Shift+C` to open the **Columns Sheet**.
 3. Move to the row referencing the column whose display you wish to format. Move the cursor to the fmtstr column.
-4. Type `e` followed by *{:,.0f}* for an `int` type and *{:,.02f}* for a floating point type.
+4. Type `e` followed by `{:,.0f}` for an `int` type and `{:,.02f}` for a floating point type.
 
-###### How to set all date columns to be **month/day/year**.
+###### How to quickly adjust the precision of a float or date?
 
-The default can be set in a `~/.visidatarc`.
+1. Ensure the column is typed as numeric column: float (`%`), floatsi (`z%`), dirty float (`$`), or date (`@`).
+2. Press `Alt+Plus` or `Alt+Minus` to adjust the precision in the current column.
+3. Or, press `Space` and use the longname `setcol-precision-more` or `setcol-precision-less`.
+
+###### How to automatically set the type of a particular column
+
+When loading sheets repeatedly with the same schema, it can be useful to pre-set the column types (and other metadata) in .visidatarc using the `knownCols` attribute on the Sheet class and its subclasses.
+
+For example, to set the "timestamp" column in every sheet to the `date` type:
+
+`Sheet.knownCols.timestamp.type = date`
+
+Or to hide the `nCols` column on the SheetsSheet by default:
+
+`SheetsSheet.knownCols.nCols.width = 0`
+
+###### How to format all date columns as **month/day/year**.
+
+The above method can be used to explicitly set the default `fmtstr` for specifically-named columns.
+However, to use a default fmtstr for all date-typed columns, set the `disp_date_fmt` option.  In .visidatarc:
 
 ~~~
 options.disp_date_fmt = '%m/%d/%Y'
 ~~~
 
-or passed through the commandline
+or pass as a commandline argument:
 
 ~~~
 vd --disp-date-fmt='%m/%d/%Y'
@@ -138,14 +157,15 @@ vd --disp-date-fmt='%m/%d/%Y'
 or set in the **Options Sheet**.
 
 1. Press `Shift+O` to open the **Options Sheet**.
-2. Move the cursor down to the relevant *disp_date_fmt* option.
-3. Type `e` followed by *%m/%d/%Y*.
+2. Move the cursor down to the relevant `disp_date_fmt` option.
+3. Type `e` followed by `%m/%d/%Y`.
+
 ---
 
 ###### How to specify a comma decimal separator when typing floating point numbers?
 
 1. Before launching VisiData, set the shell environment variable `LC_NUMERIC` to a locale which interprets commas as decimals. Any European locale should do; an example that works is `en_DK.UTF-8`.
-2. Within VisiData, set a column to type `floatlocale` by pressing `Space` followed by *type-floatlocale*.
+2. Within VisiData, set a column to type `floatlocale` by pressing `Space` followed by `type-floatlocale`.
 
 Note that `type-floatlocale` is significantly slower than `type-float`. However, if you wish to replace the current binding for `type-float` with `type-floatlocale`, add to your `~/.visidatarc`:
 
@@ -175,9 +195,9 @@ uses the commands for column splitting and transformation with [xd/puzzles.tsv](
 
 - `:` adds new columns derived from splitting the current column at positions defined by a *regex pattern*. `options.default_sample_size` (default: 100) rows around the cursor will be used to determine the number of columns that will be created.
 - `;` adds new columns derived from pulling the contents of the current column which match the *regex within capture groups*. The new columns are named using the capture group index, or if named capture groups are used, the capture group names. This command uses the `options.default_sample_size` (default:100) rows around the cursor as sample rows.
-- `*` followed by *regex*`/`*substring* replaces the text which matches the capture groups in *regex* with the contents of *substring*. *substring* may include backreferences (*\1* etc).
+- `*` followed by *regex* and then `Tab` followed by the *replacement* replaces the text matching the *regex* with the contents of *replacement*. *replacement* may include backreferences to capture groups in the regex (`\1` etc).
 
-## [How do I substitute text in my column]
+## How to substitute text in a column
 
 The `*` command can be used to do content transformations of cells. The `g*` variant transforms in-place, instead of creating a new column.
 
@@ -187,10 +207,12 @@ The following example uses [benchmarks.csv](https://raw.githubusercontent.com/sa
 
 1. Move cursor to **SKU** column.
 2. Press `gs` to select all rows.
-3. Type `g*` folowed by *food/nutri*.
+3. Press `g*` to replace text in selected rows in current column.
+4. Type `food` in the search field.
+5. Press `Tab` to go to the replace field, then type `nutri`.
+6. Press `Enter` to replace the text.
 
 - tests/transform-cols.vd
-
 
 ---
 
@@ -205,6 +227,7 @@ Command       Operation
 ` z(`         expand _current_ column to a specific depth (prompt for input)
 `gz(`         expand _all visible_ columns to a specific depth (prompt for input)
 `  )`         contract (unexpand) the current column
+` zM`         expand _current_ column row-wise within that column
 
 The following demo shows `(` commands applied to this data:
 
@@ -241,12 +264,12 @@ These variables and functions are available in the scope of an expression:
 - **`sheet`**: the current sheet (a TableSheet object)
 - **`col`**: the current column (as a Column object; use for Column metadata)
 - **`row`**: the current row (a Python object of the internal rowtype)
-- **curcol**: evaluate to the typed value of this row in the column that the cursor was on at the time that the expression column was added.
-- **cursorCol**: evaluate to the typed value of this row for the column the cursor is on. Changes as the cursor moves for `=`. Uses the column from the time the calculation was made for `g=`, `gz=`, and `z=`.
+- **`curcol`**: evaluate to the typed value of this row in the column that the cursor was on at the time that the expression column was added.
+- **`cursorCol`**: evaluate to the typed value of this row for the column the cursor is on. Changes as the cursor moves for `=`. Uses the column from the time the calculation was made for `g=`, `gz=`, and `z=`.
 
 Additional attributes can be added to sheets and columns.
 
-`col` deliberately returns a Column object, but any other Column object is interpreted as the value within that column for the same row. For example, both `curcol` and `cursorcol` return values, not the object itself.
+`col` deliberately returns a Column object, but any other Column object is interpreted as the value within that column for the same row. For example, both `curcol` and `cursorCol` return values, not the object itself.
 
 
 For example, this customizes addcol-expr to set the `curcol` attribute on the new ExprColumn to a snapshot of the current cursor column (at the time the expression column is added):
@@ -270,7 +293,7 @@ The following examples use the file [sample.tsv](https://raw.githubusercontent.c
 4. Type `|` followed by `True` to select all rows where there were more than 10 **Units** sold.
 5. Press `"` to open a duplicate sheet with only those selected rows.
 
-**Question** I have a dateset with separate columns for **Year**, **Month** and **Day**. How can I concatenate them into a single date column?
+**Question** I have a dataset with separate columns for **Year**, **Month** and **Day**. How can I concatenate them into a single date column?
 
 1. Type `=` followed by `Year + '-' + Month + '-' + Day`.
 2. Set the type of the new derived column by pressing `@` (date).
@@ -286,7 +309,7 @@ When using `=`, and wanting to reference the current column, we recommend using 
 **Question** I have a dataset with **file names**. How do I create a new column with the **file names** lower cased?
 
 1. Move the cursor to **file names** column.
-2. Type `=` followed by **curcol.casefold()**.
+2. Type `=` followed by `curcol.casefold()`.
 3. Move to the newly created column, and rename it with `^`, followed by the desired name.
 
 ---

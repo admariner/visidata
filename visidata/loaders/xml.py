@@ -1,9 +1,12 @@
-from visidata import VisiData, vd, Sheet, options, Column, Progress, setitem, ColumnAttr, vlen, RowColorizer, Path, copy
+from copy import copy
+from visidata import VisiData, vd, Sheet, options, Column, Progress, setitem, ColumnAttr, vlen, RowColorizer, Path
+
+vd.option('xml_parser_huge_tree', True, 'allow very deep trees and very long text content')
 
 
 @VisiData.api
 def open_xml(vd, p):
-    return XmlSheet(p.name, source=p)
+    return XmlSheet(p.base_stem, source=p)
 
 VisiData.open_svg = VisiData.open_xml
 
@@ -45,8 +48,11 @@ class XmlSheet(Sheet):
 
     def iterload(self):
         if isinstance(self.source, Path):
+            vd.importExternal('lxml')
             from lxml import etree, objectify
-            self.root = etree.parse(self.source.open_text(encoding=self.options.encoding))
+            p = etree.XMLParser(**self.options.getall('xml_parser_'))
+            with self.open_text_source() as fp:
+                self.root = etree.parse(fp, parser=p)
             objectify.deannotate(self.root, cleanup_namespaces=True)
         else: #        elif isinstance(self.source, XmlElement):
             self.root = self.source
@@ -79,8 +85,9 @@ class XmlSheet(Sheet):
 @VisiData.api
 def save_xml(vd, p, vs):
     isinstance(vs, XmlSheet) or vd.fail('must save xml from XmlSheet')
-    vs.root.write(str(p), encoding=options.encoding, standalone=False, pretty_print=True)
+    vs.root.write(str(p), encoding=vs.options.save_encoding, standalone=False, pretty_print=True)
 
+XmlSheet.options.save_encoding = 'utf-8'  #2520
 
 XmlSheet.addCommand('za', 'addcol-xmlattr', 'attr=input("add attribute: "); addColumnAtCursor(AttribColumn(attr, attr))', 'add column for xml attribute')
 XmlSheet.addCommand('v', 'visibility', 'showColumnsBasedOnRow(cursorRow)', 'show only columns in current row attributes')

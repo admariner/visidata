@@ -5,16 +5,17 @@ import functools
 import cProfile
 import threading
 import collections
+import subprocess
+import curses
 
 from visidata import VisiData, vd, options, globalCommand, Sheet, EscapeException
-from visidata import ColumnAttr, Column
-from visidata import *
+from visidata import ColumnAttr, Column, BaseSheet, ItemColumn
 
 
 vd.option('profile', False, 'enable profiling on threads')
 vd.option('min_memory_mb', 0, 'minimum memory to continue loading and async processing')
 
-vd.option('color_working', 'green', 'color of system running smoothly')
+vd.theme_option('color_working', '118 5', 'color of system running smoothly')
 
 BaseSheet.init('currentThreads', list)
 
@@ -85,7 +86,8 @@ def Progress(vd, iterable=None, gerund="", total=None, sheet=None):
 def cancelThread(vd, *threads, exception=EscapeException):
     'Raise *exception* in one or more *threads*.'
     for t in threads:
-        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(t.ident), ctypes.py_object(exception))
+        if t.ident is not None:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(t.ident), ctypes.py_object(exception))
 
 
 # each row is an augmented threading.Thread object
@@ -100,7 +102,7 @@ class ThreadsSheet(Sheet):
         ColumnAttr('exception'),
     ]
     def reload(self):
-        self.rows = vd.threads
+        self.rows = self.source
 
     def openRow(self, row):
         'push profile sheet for this action'
@@ -115,29 +117,32 @@ def elapsed_s(t):
 
 @VisiData.api
 def checkMemoryUsage(vd):
-    min_mem = options.min_memory_mb
     threads = vd.unfinishedThreads
     if not threads:
-        return None
-    ret = ''
-    attr = 'color_working'
-    if min_mem:
-        try:
-            freestats = subprocess.run('free --total --mega'.split(), check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip().splitlines()
-        except FileNotFoundError as e:
-            if options.debug:
-                vd.exceptionCaught(e)
-            options.min_memory_mb = 0
-            vd.warning('disabling min_memory_mb: "free" not installed')
-            return '', attr
-        tot_m, used_m, free_m = map(int, freestats[-1].split()[1:])
-        ret = '[%dMB] ' % free_m + ret
-        if free_m < min_mem:
-            attr = 'color_warning'
-            vd.warning('%dMB free < %dMB minimum, stopping threads' % (free_m, min_mem))
-            vd.cancelThread(*vd.unfinishedThreads)
-            curses.flash()
-    return ret, attr
+        return ''
+
+    min_mem = vd.options.min_memory_mb
+    if not min_mem:
+        return ''
+
+    try:
+        freestats = subprocess.run('free --total --mega'.split(), check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip().splitlines()
+    except FileNotFoundError as e:
+        if vd.options.debug:
+            vd.exceptionCaught(e)
+        vd.options.min_memory_mb = 0
+        vd.warning('disabling min_memory_mb: "free" not installed')
+        return ''
+    tot_m, used_m, free_m = map(int, freestats[-1].split()[1:])
+    ret = f'  [{free_m}MB] '
+    if free_m < min_mem:
+        attr = '[:warning]'
+        vd.warning(f'{free_m}MB free < {min_mem}MB minimum, stopping threads')
+        vd.cancelThread(*vd.unfinishedThreads)
+        curses.flash()
+    else:
+        attr = '[:working]'
+    return attr + ret + '[/]'
 
 
 # for progress bar
@@ -170,25 +175,41 @@ def _annotate_thread(t, endTime=None):
     return t
 
 # all long-running threads, including main and finished
-VisiData.init('threads', lambda: [_annotate_thread(threading.current_thread(), 0)])
-
-@VisiData.lazy_property
-def threadsSheet(self):
-    return ThreadsSheet('threads')
-
-@VisiData.lazy_property
-def memoryUsageSheet(self):
-    return MemoryUsageSheet("memory_usage")
+vd.threads = [_annotate_thread(threading.current_thread(), 0)]
 
 @VisiData.api
-def execAsync(self, func, *args, sheet=None, **kwargs):
-    'Execute ``func(*args, **kwargs)`` in a separate thread.'
+def execSync(vd, func, *args, sheet=None, **kwargs):
+    'Execute ``func(*args, **kwargs)`` in this thread (synchronously). A drop-in substitute for vd.execAsync.'
+    vd.callNoExceptions(func, *args, **kwargs)
+    t = threading.current_thread()
+    t.sheet = sheet or vd.activeSheet
+    return t
 
-    thread = threading.Thread(target=_toplevelTryFunc, daemon=True, args=(func,)+args, kwargs=kwargs)
-    self.threads.append(_annotate_thread(thread))
+@VisiData.api
+def execAsync(vd, func, *args, **kwargs):
+    '''Execute ``func(*args, **kwargs)`` in a separate thread.  `sheet` is a
+    special kwarg to indicate which sheet the thread should be associated with;
+    by default, uses vd.activeSheet.  If `sheet` explicitly given as None, the thread
+    will be ignored by vd.sync and thread status indicators.
+    '''
 
-    if sheet is None:
-        sheet = self.activeSheet
+    if 'sheet' not in kwargs:
+        sheet = vd.activeSheet
+    else:
+        sheet = kwargs.pop('sheet')
+
+    if sheet is not None and (sheet.lastCommandThreads and threading.current_thread() not in sheet.lastCommandThreads):
+        vd.fail(f'still running **{sheet.lastCommandThreads[-1].name}** from previous command')
+
+    # the current thread's activeCommand
+    cmd = vd.activeCommand
+    # the newly started thread is assigned the same activeCommand
+    def _with_active_cmd(func, *args, **kwargs):
+        if cmd: vd.activeCommand = cmd
+        _toplevelTryFunc(func, *args, **kwargs)
+        if cmd: vd.activeCommand = None
+    thread = threading.Thread(target=_with_active_cmd, daemon=True, args=(func,)+args, kwargs=kwargs)
+    vd.threads.append(_annotate_thread(thread))
 
     if sheet is not None:
         sheet.currentThreads.append(thread)
@@ -198,7 +219,7 @@ def execAsync(self, func, *args, sheet=None, **kwargs):
 
     return thread
 
-def _toplevelTryFunc(func, *args, status=vd.status, **kwargs):
+def _toplevelTryFunc(func, *args, **kwargs):
   with ThreadProfiler(threading.current_thread()) as prof:
     t = threading.current_thread()
     t.name = func.__name__
@@ -206,8 +227,7 @@ def _toplevelTryFunc(func, *args, status=vd.status, **kwargs):
         t.status = func(*args, **kwargs)
     except EscapeException as e:  # user aborted
         t.status = 'aborted by user'
-        if status:
-            status('%s aborted' % t.name, priority=2)
+        vd.warning(f'{t.name} aborted')
     except Exception as e:
         t.exception = e
         t.status = 'exception'
@@ -215,6 +235,18 @@ def _toplevelTryFunc(func, *args, status=vd.status, **kwargs):
 
     if t.sheet:
         t.sheet.currentThreads.remove(t)
+
+def asyncignore(func):
+    'Decorator like `@asyncthread` but without attaching to a sheet, so no sheet.threadStatus will show it.'
+    @functools.wraps(func)
+    def _execAsync(*args, **kwargs):
+        @functools.wraps(func)
+        def _func(*args, **kwargs):
+            func(*args, **kwargs)
+
+        return vd.execAsync(_func, *args, **kwargs, sheet=None)
+
+    return _execAsync
 
 def asyncsingle(func):
     '''Function decorator like `@asyncthread` but as a singleton.  When called, `func(...)` spawns a new thread, and cancels any previous thread still running *func*.
@@ -241,7 +273,7 @@ def asyncsingle(func):
 @VisiData.property
 def unfinishedThreads(self):
     'A list of unfinished threads (those without a recorded `endTime`).'
-    return [t for t in self.threads if getattr(t, 'endTime', None) is None]
+    return [t for t in self.threads if getattr(t, 'endTime', None) is None and getattr(t, 'sheet', None) is not None]
 
 @VisiData.api
 def checkForFinishedThreads(self):
@@ -259,14 +291,15 @@ def sync(self, *joiningThreads):
     while True:
         deads = set()  # dead threads
         threads = joiningThreads or set(self.unfinishedThreads)
-        threads -= set([threading.current_thread(), getattr(vd, 'drawThread', None)])
+        threads -= set([threading.current_thread(), getattr(vd, 'drawThread', None), getattr(vd, 'outputProgressThread', None)])
         threads -= deads
+        threads -= set([None])
         for t in threads:
             try:
-                if not t.is_alive() or getattr(t, 'noblock', False) is True:
+                if not t.is_alive() or t not in threading.enumerate() or getattr(t, 'noblock', False) is True:
                     deads.add(t)
                 else:
-                    t.join()
+                    t.join(timeout=1)
             except RuntimeError as e:  # maybe thread hasn't started yet or has already joined
                 vd.exceptionCaught(e)
                 pass
@@ -280,7 +313,7 @@ min_thread_time_s = 0.10 # only keep threads that take longer than this number o
 @VisiData.api
 def open_pyprof(vd, p):
     import pstats
-    return ProfileStatsSheet(p.name, source=pstats.Stats(p.given).stats)
+    return ProfileStatsSheet(p.base_stem, source=pstats.Stats(p.given).stats)
 
 
 @VisiData.api
@@ -316,10 +349,22 @@ class ThreadProfiler:
             # remove very-short-lived async actions
             if elapsed_s(self.thread) < min_thread_time_s:
                 vd.threads.remove(self.thread)
+            else:
+                if self.thread.sheet:
+                    if vd.options.profile:
+                        vd.status(f'[:bold]{self.thread.sheet.name[:32]}.{self.thread.name}[/] finished in {elapsed_s(self.thread):.1f}s')
+                if vd.options.profile:
+                    self.thread.profile.dump_stats(f'{self.thread.name}.pyprof')
 
 
 class ProfileSheet(Sheet):
     rowtype = 'callsites' # rowdef: profiler_entry
+    guide = '''
+        # Profile Sheet
+        - `z Ctrl+S` to save as pyprof file
+        - `Ctrl+O` to open current function in $EDITOR
+        - `Enter` to open list of calls from current function
+    '''
     columns = [
         Column('funcname', getter=lambda col,row: codestr(row.code)),
         Column('filename', getter=lambda col,row: os.path.split(row.code.co_filename)[-1] if not isinstance(row.code, str) else ''),
@@ -390,28 +435,9 @@ def codestr(code):
     return code.co_name
 
 
-class MemoryUsageSheet(Sheet):
-    rowtype = 'samples'  # rowdef: dict(t:time_t, data_MB:float)
-    columns = [
-        ItemColumn('t', type=date, fmtstr="%H:%M:%S"),
-        ItemColumn('data_MB', type=int),
-    ]
-    nKeys = 1
-    def iterload(self):
-        import psutil
-        proc = psutil.Process()
-        while True:
-            r = proc.memory_info()
-            yield {
-                't': time.time(),
-                'data_MB': r.data/1000000,
-            }
-            time.sleep(1)
-
-
 ThreadsSheet.addCommand('^C', 'cancel-thread', 'cancelThread(cursorRow)', 'abort thread at current row')
+ThreadsSheet.addCommand('g^C', 'cancel-all', 'cancelThread(*sheet.rows)', 'abort all threads on this threads sheet')
 ThreadsSheet.addCommand(None, 'add-row', 'fail("cannot add new rows on Threads Sheet")', 'invalid command')
-
 
 ProfileSheet.addCommand('z^S', 'save-profile', 'source.dump_stats(input("save profile to: ", value=name+".prof"))', 'save profile')
 ProfileSheet.addCommand('^O', 'sysopen-row', 'launchEditor(cursorRow.code.co_filename, "+%s" % cursorRow.code.co_firstlineno)', 'open current file at referenced row in external $EDITOR')
@@ -420,14 +446,21 @@ ProfileStatsSheet.addCommand('^O', 'sysopen-row', 'launchEditor(cursorRow[0], "+
 BaseSheet.addCommand('^_', 'toggle-profile', 'toggleProfiling()', 'Enable or disable profiling on main VisiData process')
 
 BaseSheet.addCommand('^C', 'cancel-sheet', 'cancelThread(*sheet.currentThreads or fail("no active threads on this sheet"))', 'abort all threads on current sheet')
-BaseSheet.addCommand('g^C', 'cancel-all', 'liveThreads=list(t for vs in vd.sheets for t in vs.currentThreads); cancelThread(*liveThreads); status("canceled %s threads" % len(liveThreads))', 'abort all secondary threads')
+BaseSheet.addCommand('g^C', 'cancel-all', 'liveThreads=list(t for vs in vd.sheets for t in vs.currentThreads); cancelThread(*liveThreads); status("canceled %s threads" % len(liveThreads))', 'abort all spawned threads')
 
-BaseSheet.addCommand('^T', 'threads-all', 'vd.push(vd.threadsSheet)', 'open Threads Sheet')
-BaseSheet.addCommand('z^T', 'open-memusage', 'vd.push(vd.memoryUsageSheet)', 'open Memory Usage Sheet')
 
+BaseSheet.addCommand('^T', 'threads-all', 'vd.push(ThreadsSheet("threads", source=vd.threads))', 'open Threads for all sheets')
+BaseSheet.addCommand('z^T', 'threads-sheet', 'vd.push(ThreadsSheet("threads", source=sheet.currentThreads))', 'open Threads for this sheet')
 
 vd.addGlobals({
+    'ThreadsSheet': ThreadsSheet,
     'Progress': Progress,
     'asynccache': asynccache,
     'asyncsingle': asyncsingle,
+    'asyncignore': asyncignore,
 })
+
+vd.addMenuItems('''
+    System > Threads sheet > threads-all
+    System > Toggle profiling > toggle-profile
+''')

@@ -31,7 +31,7 @@ The current implementation uses braille Unicode characters (inspired by [asciimo
 A `Plotter` is a [`Sheet`](/design/sheet) with a pixel-addressable drawing surface that covers the entire terminal (minus the status line).  Pixels and labels are plotted at exact locations in the terminal window, and must be recalculated after any zoomlevel change or terminal resizing.
 
 `Plotter.draw(scr)` is called multiple times per second to update the screen, and chooses a curses attribute for each pixel.
-By default, the most common attr is chosen for each pixel, but if `options.disp_pixel_random` is set, an attr will be randomly chosen from the naturally weighted set of attrs (this may cause blocks of pixels to flicker between their possible attrs).
+By default, the most common attr is chosen for each pixel, but if `options.disp_graph_pixel_random` is set, an attr will be randomly chosen from the naturally weighted set of attrs (this may cause blocks of pixels to flicker between their possible attrs).
 If an attr is in the `Canvas.hiddenAttrs` set, then it is not considered for display at all (and its rows will be ignored during selection).
 
 All Plotter coordinates must be integer numbers of pixels.
@@ -96,7 +96,7 @@ While the Plotter API requires literal integer values for `x`/`y` and `width`/`h
 
 #### `Canvas` methods
 
-- `Canvas.polyline(vertexes, attr, row=None)` adds a multi-segment line from the list of (x,y) `vertexes`.  One vertex draws a point; two vertexes draws a single line.  Note that the vertexes are *not* Point objects (unlike parameters for other methods).
+- `Canvas.polyline(vertices, attr, row=None)` adds a multi-segment line from the list of (x,y) `vertices`.  One vertex draws a point; two vertices draws a single line.  Note that the vertices are *not* Point objects (unlike parameters for other methods).
 - `Canvas.label(xy, text, attr, row=None)` adds `text` at `xy` (Point in canvas units).
 - `Canvas.fixPoint(xyplotter, xycanvas)` sets the position of the `visibleBox` so that `xycanvas` (Point in Canvas units) is plotted at `xyplotter` (Point in Plotter units).
 - `Canvas.zoomTo(bbox)` sets the visible bounds so the given canvas coordinates will fill the entire Plotter area.  `aspectRatio` will still be obeyed.

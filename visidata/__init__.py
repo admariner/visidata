@@ -1,10 +1,10 @@
 'VisiData: a curses interface for exploring and arranging tabular data'
 
-__version__ = '2.10dev'
+__version__ = '3.2dev'
 __version_info__ = 'VisiData v' + __version__
 __author__ = 'Saul Pwanson <vd@saul.pw>'
 __status__ = 'Production/Stable'
-__copyright__ = 'Copyright (c) 2016-2021 ' + __author__
+__copyright__ = 'Copyright (c) 2016-2024 ' + __author__
 
 
 class EscapeException(BaseException):
@@ -12,18 +12,19 @@ class EscapeException(BaseException):
     pass
 
 
-def addGlobals(g):
-    '''Update the VisiData globals dict with items from *g*, which is a mapping of names to functions.
-    Importers can call ``addGlobals(globals())`` to have their globals accessible to execstrings.'''
-    globals().update(g)
+def addGlobals(*args, **kwargs):
+    '''Update the VisiData globals dict with items from *args* and *kwargs*; to add symbols available to command execstrings and eval strings like command expr.'
+
+    Dunder methods are ignored, to prevent accidentally overwriting housekeeping methods.'''
+    drop_dunder = lambda d: {k: v for k, v in d.items() if not k.startswith("__")}
+    for g in args:
+        globals().update(drop_dunder(g))
+    globals().update(drop_dunder(kwargs))
 
 
 def getGlobals():
     'Return the VisiData globals dict.'
     return globals()
-
-from builtins import *
-from copy import copy, deepcopy
 
 from .utils import *
 
@@ -39,128 +40,120 @@ vd.getGlobals = getGlobals
 import visidata.keys
 
 from .basesheet import *
+
 import visidata.settings
-from .errors import *
-from .editor import *
-from .cliptext import *
-from .color import *
-from .mainloop import *
-from .wrappers import *
-from .undo import *
 
-from ._types import *
-from .column import *
+# importModule tracks where commands/options/etc are coming from (via vd.importingModule)
+core_imports = '''
+import visidata.errors
+import visidata.editor
+import visidata.color
+import visidata.cliptext
+import visidata.mainloop
 
-from .sheets import *
+import visidata.menu
+import visidata.wrappers
+import visidata.undo
+import visidata._types
+import visidata.column
+
+import visidata.interface
+import visidata.sheets
+import visidata.rename_col
+import visidata.indexsheet
 
 import visidata.statusbar
 
 import visidata.textsheet
 import visidata.threads
-from .path import *
+import visidata.path
+import visidata.guide
+
+import visidata.stored_list
 import visidata._input
+import visidata.tuiwin
+import visidata.mouse
 import visidata.movement
+
+import visidata.type_date
 
 import visidata._urlcache
 import visidata.selection
+import visidata.text_source
+import visidata.loaders
 import visidata.loaders.tsv
 import visidata.pyobj
 import visidata.loaders.json
 import visidata._open
 import visidata.save
-import visidata.clipboard
-import visidata.slide
 import visidata.search
-import visidata.expr
 
-import visidata.menu
-import visidata.choose
+import visidata.expr
 import visidata.metasheets
-import visidata.join
+import visidata.input_history
+import visidata.optionssheet
+import visidata.type_currency
+import visidata.type_floatsi
+import visidata.clean_names
+import visidata.cmdlog
+import visidata.clipboard
+import visidata.choose
 import visidata.aggregators
-import visidata.describe
 import visidata.pivot
 import visidata.freqtbl
-import visidata.melt
-import visidata.cmdlog
-import visidata.freeze
-import visidata.regex
 import visidata.canvas
 import visidata.canvas_text
 import visidata.graph
 import visidata.motd
-import visidata.transpose
 import visidata.shell
-import visidata.layout
 import visidata.main
 import visidata.help
 import visidata.modify
 import visidata.sort
-import visidata.unfurl
-import visidata.fill
-import visidata.incr
-import visidata.window
-import visidata.customdate
-import visidata.misc
 import visidata.memory
 import visidata.macros
+
 import visidata.macos
-
-import visidata.loaders.csv
-import visidata.loaders.archive
-import visidata.loaders.xlsx
-import visidata.loaders.xlsb
-import visidata.loaders.hdf5
-import visidata.loaders.sqlite
-import visidata.loaders.fixed_width
-import visidata.loaders.postgres
-import visidata.loaders.mysql
-import visidata.loaders.shp
-import visidata.loaders.geojson
-import visidata.loaders.mbtiles
-import visidata.loaders.http
-import visidata.loaders.html
-import visidata.loaders.markdown
-import visidata.loaders.pcap
-import visidata.loaders.png
-import visidata.loaders.ttf
-import visidata.loaders.sas
-import visidata.loaders.spss
-import visidata.loaders.xml
-import visidata.loaders.yaml
-import visidata.loaders._pandas
-import visidata.loaders.graphviz
-import visidata.loaders.npy
-import visidata.loaders.usv
-import visidata.loaders.frictionless
-import visidata.loaders.imap
-
-import visidata.loaders.pdf
-import visidata.loaders.pandas_freqtbl
-import visidata.loaders.xword
-import visidata.loaders.vcf
-import visidata.loaders.texttables
-import visidata.loaders.rec
-import visidata.loaders.eml
-import visidata.loaders.vds
-import visidata.loaders.odf
-import visidata.loaders.lsv
-import visidata.loaders.arrow
-import visidata.loaders.parquet
+import visidata.windows
 
 import visidata.form
+import visidata.sidebar
 
 import visidata.ddwplay
 import visidata.plugins
 
-import visidata.colorsheet
+import visidata.theme
+import visidata.apps
+import visidata.fuzzymatch
+import visidata.hint
+'''
 
-from .deprecated import *
+for line in core_imports.splitlines():
+    if not line: continue
+    module = line[len('import '):]
+    vd.importModule(module)
 
-import math
-import random
-from math import *
+vd.importSubmodules('visidata.loaders')
 
-vd.finalInit()
+def importFeatures():
+    vd.importSubmodules('visidata.features')
+    vd.importSubmodules('visidata.themes')
 
-vd.addGlobals(globals())
+    import visidata.deprecated
+
+    vd.importModule('copy', 'copy deepcopy'.split())
+    vd.importModule('builtins', 'abs all any ascii bin bool bytes callable chr complex dict dir divmod enumerate eval filter float format getattr hex int len list map max min next oct ord pow range repr reversed round set sorted str sum tuple type zip'.split())
+    vd.importModule('math', 'acos acosh asin asinh atan atan2 atanh ceil copysign cos cosh degrees dist erf erfc exp expm1 fabs factorial floor fmod frexp fsum gamma gcd hypot isclose isfinite isinf isnan isqrt lcm ldexp lgamma log log1p log10 log2 modf radians remainder sin sinh sqrt tan tanh trunc prod perm comb nextafter ulp pi e tau inf nan'.split())
+    vd.importModule('random', 'randrange randint choice choices sample uniform gauss lognormvariate'.split())
+    vd.importModule('string', 'ascii_letters ascii_lowercase ascii_uppercase digits hexdigits punctuation printable whitespace'.split())
+    vd.importModule('json')
+    vd.importModule('itertools')
+    vd.importModule('curses')
+
+    import visidata.experimental  # import nothing by default but make package accessible
+
+vd.finalInit()  # call all VisiData.init() from modules
+
+importFeatures()
+
+vd.addGlobals(vd=vd) # globals())
